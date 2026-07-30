@@ -1,0 +1,148 @@
+# =============================================================================
+# PREDICT — Predictive Maintenance CMSS
+# Docker Compose stack (local PoC)
+# =============================================================================
+# Services:
+#   mosquitto  - MQTT broker (sensor data transport)
+#   postgres   - PostgreSQL 16 + TimescaleDB (relational + time-series)
+#   redis      - Redis 7 (latest state, alert queue, websocket pubsub)
+#   backend    - FastAPI (REST + WebSocket + MQTT ingestion)
+#   simulator  - FMC150 telematics emulator (publishes synthetic data)
+#   frontend   - React + Vite dashboard
+# =============================================================================
+
+services:
+  # ── MQTT Broker ─────────────────────────────────────────────────────────────
+  mosquitto:
+    build:
+      context: ./mosquitto
+      dockerfile: Dockerfile
+    container_name: predict_mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"      # MQTT
+      - "9001:9001"      # WebSocket (optional debug)
+    volumes:
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    healthcheck:
+      # Broker is ready once an authenticated publish succeeds
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-p", "1883",
+             "-t", "health/check", "-m", "ok", "-q", "0",
+             "-u", "predict_sim", "-P", "predict_sim_pass",
+             "-i", "mosquitto-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - predict_net
+
+  # ── PostgreSQL + TimescaleDB ────────────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: predict_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-predict}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-predict_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-predict}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-predict} -d ${POSTGRES_DB:-predict}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - predict_net
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: predict_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - predict_net
+
+  # ── Backend (FastAPI) ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: predict_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    networks:
+      - predict_net
+
+  # ── FMC150 Simulator ────────────────────────────────────────────────────────
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: predict_simulator
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - predict_net
+
+  # ── Frontend (React + Vite) ─────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: predict_frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - predict_net
+
+networks:
+  predict_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redis_data:
+  mosquitto_data:
+  mosquitto_log:
