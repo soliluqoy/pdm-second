@@ -49,10 +49,6 @@ class ApiClient {
     return this.request<any[]>('/dashboard/health');
   }
 
-  getFleetTelemetry() {
-    return this.request<any[]>('/dashboard/telemetry');
-  }
-
   getVehicleReadings(vehicleId: number, sensorType?: string, hours = 1) {
     const params = new URLSearchParams({ hours: String(hours) });
     if (sensorType) params.set('sensor_type', sensorType);

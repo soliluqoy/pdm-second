@@ -174,67 +174,7 @@ export interface VehicleHealthItem {
   license_plate?: string;
   active_alert_count: number;
   open_work_order_count: number;
-  latest_readings?: {
-    timestamp?: string;
-    imei?: string;
-    vehicle_id?: number;
-    vehicle_name?: string;
-    ignition?: boolean;
-    gps?: VehicleGps;
-    sensors?: Record<string, { value: number; unit: string }>;
-  };
-}
-
-// ── Live Telemetry (GET /dashboard/telemetry) ──────────────────────────────
-
-export type SensorStatus = 'normal' | 'warning' | 'critical' | 'no_data';
-export type ThresholdDirection = 'high' | 'low';
-
-export interface VehicleGps {
-  latitude?: number;
-  longitude?: number;
-  speed?: number;
-  altitude?: number;
-  angle?: number;
-  satellites?: number;
-}
-
-export interface RuleTrigger {
-  rule_id: number;
-  name: string;
-  operator: string;
-  threshold_value: number;
-  duration_seconds: number;
-  severity: AlertSeverity;
-}
-
-export interface SensorTelemetryItem {
-  sensor_type: string;
-  name: string;
-  component?: string;
-  unit?: string;
-  value?: number;
-  min_value?: number;
-  max_value?: number;
-  warning_threshold?: number;
-  critical_threshold?: number;
-  /** Which side of the scale is dangerous ('high' = over, 'low' = under) */
-  direction: ThresholdDirection;
-  status: SensorStatus;
-  triggers: RuleTrigger[];
-}
-
-export interface VehicleTelemetry {
-  id: number;
-  name: string;
-  license_plate?: string;
-  imei: string;
-  health: AssetHealth;
-  last_seen?: string;
-  ignition?: boolean;
-  gps?: VehicleGps;
-  state_timestamp?: string;
-  sensors: SensorTelemetryItem[];
+  latest_readings?: Record<string, { value: number; unit: string }>;
 }
 
 export interface MaintenanceHistory {

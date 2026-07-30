@@ -334,53 +334,6 @@ class VehicleHealthItem(BaseModel):
 
 
 # =============================================================================
-# Dashboard — Live Telemetry (per-vehicle sensor values + thresholds + rules)
-# =============================================================================
-class RuleTriggerOut(ORMBase):
-    """An active rule trigger attached to a sensor type (a "trigger point")."""
-    rule_id: int
-    name: str
-    operator: str
-    threshold_value: float
-    duration_seconds: int = 0
-    severity: AlertSeverity
-
-
-class SensorTelemetryItem(BaseModel):
-    """One sensor: live reading + configured operating limits + trigger points."""
-    sensor_type: str
-    name: str
-    component: Optional[str] = None
-    unit: Optional[str] = None
-    value: Optional[float] = None
-    min_value: Optional[float] = None
-    max_value: Optional[float] = None
-    warning_threshold: Optional[float] = None
-    critical_threshold: Optional[float] = None
-    # Which side of the scale is dangerous, inferred from rule operators:
-    # "high" → alert when value rises past threshold (e.g. coolant temp)
-    # "low"  → alert when value drops below threshold (e.g. fuel, battery)
-    direction: str = "high"
-    # Live status vs thresholds: normal | warning | critical | no_data
-    status: str = "no_data"
-    triggers: List[RuleTriggerOut] = []
-
-
-class VehicleTelemetryOut(BaseModel):
-    """Full live telemetry snapshot for one vehicle."""
-    id: int
-    name: str
-    license_plate: Optional[str] = None
-    imei: str
-    health: AssetHealth
-    last_seen: Optional[datetime] = None
-    ignition: Optional[bool] = None
-    gps: Optional[dict] = None
-    state_timestamp: Optional[datetime] = None
-    sensors: List[SensorTelemetryItem] = []
-
-
-# =============================================================================
 # Maintenance History
 # =============================================================================
 class MaintenanceHistoryOut(ORMBase):
