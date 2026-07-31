@@ -177,6 +177,47 @@ export interface VehicleHealthItem {
   latest_readings?: Record<string, { value: number; unit: string }>;
 }
 
+export type SensorStatus = 'ok' | 'warning' | 'critical' | 'offline';
+export type SensorDirection = 'high' | 'low';
+
+export interface TriggerRuleInfo {
+  id: number;
+  name: string;
+  operator?: string;
+  threshold_value?: number;
+  duration_seconds: number;
+  severity: AlertSeverity;
+}
+
+export interface LiveSensorItem {
+  sensor_type: string;
+  name: string;
+  unit?: string;
+  value?: number;
+  min_value?: number;
+  max_value?: number;
+  warning_threshold?: number;
+  critical_threshold?: number;
+  direction: SensorDirection;
+  status: SensorStatus;
+  rules: TriggerRuleInfo[];
+}
+
+export interface VehicleLiveItem {
+  id: number;
+  name: string;
+  imei: string;
+  license_plate?: string;
+  health: AssetHealth;
+  last_seen?: string;
+  ignition?: boolean;
+  speed?: number;
+  telemetry_timestamp?: string;
+  active_alert_count: number;
+  open_work_order_count: number;
+  sensors: LiveSensorItem[];
+}
+
 export interface MaintenanceHistory {
   id: number;
   vehicle_id: number;

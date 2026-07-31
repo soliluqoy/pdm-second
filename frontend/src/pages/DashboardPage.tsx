@@ -1,37 +1,56 @@
 /**
  * PREDICT — Dashboard Page
- * Fleet health overview, summary cards, live vehicle status.
+ * Fleet summary cards + live telemetry grid: every running sensor with its
+ * current reading, thresholds, and trigger points, updated via WebSocket.
  */
-import { useEffect, useState, useCallback } from 'react';
-import { api } from '../api/client';
-import type { DashboardSummary, VehicleHealthItem, WSMessage } from '../types';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Truck,
+  Activity,
   AlertTriangle,
   ClipboardList,
-  Activity,
   Eye,
-  CheckCircle2,
-  Clock,
+  Radio,
+  Truck,
 } from 'lucide-react';
+import { api } from '../api/client';
+import SensorDetailDrawer from '../components/dashboard/SensorDetailDrawer';
+import VehicleTelemetryCard from '../components/dashboard/VehicleTelemetryCard';
+import type {
+  DashboardSummary,
+  LiveSensorItem,
+  VehicleLiveItem,
+  WSMessage,
+} from '../types';
+import { computeSensorStatus } from '../utils/sensors';
 
 interface Props {
   wsMessages: WSMessage[];
 }
 
+interface SelectedSensor {
+  vehicleId: number;
+  sensorType: string;
+}
+
 export default function DashboardPage({ wsMessages }: Props) {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
-  const [vehicles, setVehicles] = useState<VehicleHealthItem[]>([]);
+  const [fleet, setFleet] = useState<VehicleLiveItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState<SelectedSensor | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const lastWsIdx = useRef(0);
+  const refreshTimer = useRef<number | null>(null);
 
-  const fetchData = useCallback(async () => {
+  // ── Data fetching ──────────────────────────────────────────────────
+  const fetchData = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setLoading(true);
     try {
-      const [s, v] = await Promise.all([
+      const [s, f] = await Promise.all([
         api.getDashboardSummary(),
-        api.getFleetHealth(),
+        api.getFleetLive(),
       ]);
       setSummary(s);
-      setVehicles(v);
+      setFleet(f);
     } catch (e) {
       console.error('Failed to fetch dashboard data:', e);
     } finally {
@@ -40,212 +59,230 @@ export default function DashboardPage({ wsMessages }: Props) {
   }, []);
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 10000);
+    fetchData(true);
+    // Slow fallback poll — WS telemetry handles the fast path
+    const interval = setInterval(() => fetchData(), 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // Update on WS messages
+  // 1s ticker for relative "last update" labels
   useEffect(() => {
-    if (wsMessages.length > 0) {
-      fetchData();
-    }
-  }, [wsMessages, fetchData]);
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
 
-  const healthColor = (health: string) => {
-    switch (health) {
-      case 'green': return 'bg-green-100 text-green-800 border-green-300';
-      case 'yellow': return 'bg-yellow-100 text-yellow-800 border-yellow-300';
-      case 'red': return 'bg-red-100 text-red-800 border-red-300';
-      default: return 'bg-gray-100 text-gray-600 border-gray-300';
-    }
-  };
+  // Debounced full refresh for non-telemetry events (alerts, health, WOs)
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => fetchData(), 1500);
+  }, [fetchData]);
 
-  const healthDot = (health: string) => {
-    switch (health) {
-      case 'green': return 'bg-green-500';
-      case 'yellow': return 'bg-yellow-500';
-      case 'red': return 'bg-red-500';
-      default: return 'bg-gray-400';
-    }
-  };
+  // ── Live WebSocket updates ─────────────────────────────────────────
+  const patchTelemetry = useCallback((payload: any) => {
+    const vehicleId = payload?.vehicle_id;
+    const data = payload?.data;
+    if (!vehicleId || !data) return;
+    setFleet((prev) =>
+      prev.map((v) => {
+        if (v.id !== vehicleId) return v;
+        const live = data.sensors ?? {};
+        const sensors = v.sensors.map((s) => {
+          const r = live[s.sensor_type];
+          if (!r || r.value === undefined || r.value === null) return s;
+          return {
+            ...s,
+            value: r.value,
+            unit: r.unit ?? s.unit,
+            status: computeSensorStatus(r.value, s),
+          };
+        });
+        return {
+          ...v,
+          sensors,
+          ignition: data.ignition ?? v.ignition,
+          speed: data.gps?.speed ?? v.speed,
+          telemetry_timestamp: data.timestamp ?? v.telemetry_timestamp,
+          last_seen: data.timestamp ?? v.last_seen,
+        };
+      })
+    );
+  }, []);
 
+  useEffect(() => {
+    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
+      const msg = wsMessages[i];
+      if (msg.channel === 'ws:telemetry') {
+        patchTelemetry(msg.data);
+      } else if (
+        msg.channel === 'ws:alerts' ||
+        msg.channel === 'ws:health' ||
+        msg.channel === 'ws:workorders'
+      ) {
+        scheduleRefresh();
+      }
+    }
+    lastWsIdx.current = wsMessages.length;
+  }, [wsMessages, patchTelemetry, scheduleRefresh]);
+
+  // ── Selected sensor (derived so it stays live) ─────────────────────
+  const selectedVehicle = selected
+    ? fleet.find((v) => v.id === selected.vehicleId)
+    : undefined;
+  const selectedSensor: LiveSensorItem | undefined = selectedVehicle?.sensors.find(
+    (s) => s.sensor_type === selected?.sensorType
+  );
+
+  const onlineCount = fleet.filter(
+    (v) => v.telemetry_timestamp && now - new Date(v.telemetry_timestamp).getTime() <= 30_000
+  ).length;
+
+  // ── Loading skeleton ───────────────────────────────────────────────
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-gray-500 text-lg">Loading dashboard...</div>
+      <div className="p-6 space-y-5">
+        <div className="h-8 w-64 bg-gray-200 rounded-lg animate-pulse" />
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {[...Array(4)].map((_, i) => (
+            <div key={i} className="h-28 bg-white rounded-xl border border-gray-200 animate-pulse" />
+          ))}
+        </div>
+        {[...Array(3)].map((_, i) => (
+          <div key={i} className="h-72 bg-white rounded-xl border border-gray-200 animate-pulse" />
+        ))}
       </div>
     );
   }
 
   return (
     <div className="p-6">
-      {/* ── Header ────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between mb-6">
+      {/* ── Header ─────────────────────────────────────────────────── */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Fleet Dashboard</h1>
-          <p className="text-sm text-gray-500">Real-time asset health and work order status</p>
+          <p className="text-sm text-gray-500">
+            Live sensor telemetry, thresholds, and trigger points across the fleet
+          </p>
         </div>
-        {summary?.shadow_mode && (
-          <div className="flex items-center gap-2 px-4 py-2 bg-purple-100 text-purple-800 rounded-lg border border-purple-300">
-            <Eye className="w-4 h-4" />
-            <span className="text-sm font-medium">Shadow Mode Active</span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 px-3 py-2 bg-emerald-50 text-emerald-700 rounded-lg border border-emerald-200">
+            <Radio className="w-4 h-4 animate-pulse" />
+            <span className="text-sm font-medium tabular-nums">
+              {onlineCount}/{fleet.length} streaming
+            </span>
           </div>
-        )}
+          {summary?.shadow_mode && (
+            <div className="flex items-center gap-2 px-3 py-2 bg-purple-100 text-purple-800 rounded-lg border border-purple-300">
+              <Eye className="w-4 h-4" />
+              <span className="text-sm font-medium">Shadow Mode</span>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* ── Summary Cards ─────────────────────────────────────────── */}
+      {/* ── Summary Cards ──────────────────────────────────────────── */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        {/* Total Vehicles */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <div className="p-2 bg-predict-50 rounded-lg">
-              <Truck className="w-6 h-6 text-predict-600" />
+        <SummaryCard
+          icon={<Truck className="w-6 h-6 text-predict-600" />}
+          iconBg="bg-predict-50"
+          value={summary?.total_vehicles ?? 0}
+          label="Total Vehicles"
+          sub={
+            <div className="flex gap-2 text-xs">
+              {([
+                ['bg-emerald-500', summary?.green_count],
+                ['bg-amber-500', summary?.yellow_count],
+                ['bg-red-500', summary?.red_count],
+                ['bg-gray-400', summary?.grey_count],
+              ] as const).map(([cls, n], i) => (
+                <span key={i} className="flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${cls}`} />
+                  {n ?? 0}
+                </span>
+              ))}
             </div>
-            <span className="text-3xl font-bold text-gray-900">{summary?.total_vehicles ?? 0}</span>
-          </div>
-          <p className="text-sm text-gray-500">Total Vehicles</p>
-          <div className="flex gap-2 mt-2 text-xs">
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-green-500" />
-              {summary?.green_count ?? 0}
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-yellow-500" />
-              {summary?.yellow_count ?? 0}
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-red-500" />
-              {summary?.red_count ?? 0}
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-gray-400" />
-              {summary?.grey_count ?? 0}
-            </span>
-          </div>
-        </div>
-
-        {/* Active Alerts */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <div className="p-2 bg-red-50 rounded-lg">
-              <AlertTriangle className="w-6 h-6 text-red-600" />
-            </div>
-            <span className="text-3xl font-bold text-gray-900">{summary?.active_alerts ?? 0}</span>
-          </div>
-          <p className="text-sm text-gray-500">Active Alerts</p>
-          <p className="text-xs text-red-600 mt-2">
-            {summary?.critical_alerts ?? 0} critical
-          </p>
-        </div>
-
-        {/* Open Work Orders */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <div className="p-2 bg-blue-50 rounded-lg">
-              <ClipboardList className="w-6 h-6 text-blue-600" />
-            </div>
-            <span className="text-3xl font-bold text-gray-900">{summary?.open_work_orders ?? 0}</span>
-          </div>
-          <p className="text-sm text-gray-500">Open Work Orders</p>
-          <p className="text-xs text-blue-600 mt-2">
-            {summary?.in_progress_work_orders ?? 0} in progress
-          </p>
-        </div>
-
-        {/* Shadow Work Orders */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
-          <div className="flex items-center justify-between mb-3">
-            <div className="p-2 bg-purple-50 rounded-lg">
-              <Eye className="w-6 h-6 text-purple-600" />
-            </div>
-            <span className="text-3xl font-bold text-gray-900">{summary?.shadow_work_orders ?? 0}</span>
-          </div>
-          <p className="text-sm text-gray-500">Shadow Work Orders</p>
-          <p className="text-xs text-purple-600 mt-2">Pending review</p>
-        </div>
+          }
+        />
+        <SummaryCard
+          icon={<AlertTriangle className="w-6 h-6 text-red-600" />}
+          iconBg="bg-red-50"
+          value={summary?.active_alerts ?? 0}
+          label="Active Alerts"
+          sub={<p className="text-xs text-red-600">{summary?.critical_alerts ?? 0} critical</p>}
+        />
+        <SummaryCard
+          icon={<ClipboardList className="w-6 h-6 text-blue-600" />}
+          iconBg="bg-blue-50"
+          value={summary?.open_work_orders ?? 0}
+          label="Open Work Orders"
+          sub={<p className="text-xs text-blue-600">{summary?.in_progress_work_orders ?? 0} in progress</p>}
+        />
+        <SummaryCard
+          icon={<Eye className="w-6 h-6 text-purple-600" />}
+          iconBg="bg-purple-50"
+          value={summary?.shadow_work_orders ?? 0}
+          label="Shadow Work Orders"
+          sub={<p className="text-xs text-purple-600">Pending review</p>}
+        />
       </div>
 
-      {/* ── Fleet Health Table ────────────────────────────────────── */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200">
-        <div className="px-5 py-4 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900">Fleet Health</h2>
-          <p className="text-sm text-gray-500">Sorted by priority — at-risk vehicles first</p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="bg-gray-50 border-b border-gray-200">
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Vehicle</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Plate</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">IMEI</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Seen</th>
-                <th className="px-5 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Alerts</th>
-                <th className="px-5 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Work Orders</th>
-                <th className="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Latest Readings</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-200">
-              {vehicles.length === 0 ? (
-                <tr>
-                  <td colSpan={8} className="px-5 py-8 text-center text-gray-400">
-                    No vehicles found. Ensure the simulator is running.
-                  </td>
-                </tr>
-              ) : (
-                vehicles.map((v) => (
-                  <tr key={v.id} className="hover:bg-gray-50">
-                    <td className="px-5 py-3">
-                      <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium border ${healthColor(v.health)}`}>
-                        <span className={`w-1.5 h-1.5 rounded-full ${healthDot(v.health)}`} />
-                        {v.health}
-                      </span>
-                    </td>
-                    <td className="px-5 py-3 text-sm font-medium text-gray-900">{v.name}</td>
-                    <td className="px-5 py-3 text-sm text-gray-600">{v.license_plate || '—'}</td>
-                    <td className="px-5 py-3 text-sm text-gray-500 font-mono">{v.imei}</td>
-                    <td className="px-5 py-3 text-sm text-gray-500">
-                      {v.last_seen ? new Date(v.last_seen).toLocaleTimeString() : '—'}
-                    </td>
-                    <td className="px-5 py-3 text-center">
-                      {v.active_alert_count > 0 ? (
-                        <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-100 text-red-700 text-xs font-bold">
-                          {v.active_alert_count}
-                        </span>
-                      ) : (
-                        <span className="text-gray-300">—</span>
-                      )}
-                    </td>
-                    <td className="px-5 py-3 text-center">
-                      {v.open_work_order_count > 0 ? (
-                        <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 text-blue-700 text-xs font-bold">
-                          {v.open_work_order_count}
-                        </span>
-                      ) : (
-                        <span className="text-gray-300">—</span>
-                      )}
-                    </td>
-                    <td className="px-5 py-3">
-                      {v.latest_readings && Object.keys(v.latest_readings).length > 0 ? (
-                        <div className="flex flex-wrap gap-1">
-                          {Object.entries(v.latest_readings).slice(0, 4).map(([key, val]: [string, any]) => (
-                            <span key={key} className="text-xs bg-gray-100 px-2 py-0.5 rounded text-gray-600">
-                              {key.replace(/_/g, ' ')}: {val.value}{val.unit || ''}
-                            </span>
-                          ))}
-                        </div>
-                      ) : (
-                        <span className="text-gray-300 text-xs">No data</span>
-                      )}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+      {/* ── Live Telemetry ─────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 mb-4">
+        <Activity className="w-5 h-5 text-predict-600" />
+        <h2 className="text-lg font-semibold text-gray-900">Live Sensor Telemetry</h2>
+        <span className="text-xs text-gray-400">— every sensor, its reading, and trigger points</span>
       </div>
+
+      {fleet.length === 0 ? (
+        <div className="bg-white rounded-xl border border-gray-200 py-16 text-center text-gray-400">
+          No vehicles found. Ensure the simulator is running.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 2xl:grid-cols-2 gap-5">
+          {fleet.map((v) => (
+            <VehicleTelemetryCard
+              key={v.id}
+              vehicle={v}
+              now={now}
+              onSelectSensor={(s) => setSelected({ vehicleId: v.id, sensorType: s.sensor_type })}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* ── Sensor detail drawer ───────────────────────────────────── */}
+      {selectedVehicle && selectedSensor && (
+        <SensorDetailDrawer
+          vehicle={selectedVehicle}
+          sensor={selectedSensor}
+          onClose={() => setSelected(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Summary card ─────────────────────────────────────────────────────────────
+function SummaryCard({
+  icon,
+  iconBg,
+  value,
+  label,
+  sub,
+}: {
+  icon: React.ReactNode;
+  iconBg: string;
+  value: number;
+  label: string;
+  sub: React.ReactNode;
+}) {
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 hover:shadow-md transition-shadow">
+      <div className="flex items-center justify-between mb-3">
+        <div className={`p-2 ${iconBg} rounded-lg`}>{icon}</div>
+        <span className="text-3xl font-bold text-gray-900 tabular-nums">{value}</span>
+      </div>
+      <p className="text-sm text-gray-500">{label}</p>
+      <div className="mt-2">{sub}</div>
     </div>
   );
 }

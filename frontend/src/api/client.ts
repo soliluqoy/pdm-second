@@ -49,6 +49,10 @@ class ApiClient {
     return this.request<any[]>('/dashboard/health');
   }
 
+  getFleetLive() {
+    return this.request<import('../types').VehicleLiveItem[]>('/dashboard/fleet/live');
+  }
+
   getVehicleReadings(vehicleId: number, sensorType?: string, hours = 1) {
     const params = new URLSearchParams({ hours: String(hours) });
     if (sensorType) params.set('sensor_type', sensorType);

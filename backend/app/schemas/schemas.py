@@ -333,6 +333,47 @@ class VehicleHealthItem(BaseModel):
     latest_readings: Optional[dict] = None
 
 
+class TriggerRuleInfo(BaseModel):
+    """An active threshold rule that can fire on a sensor (its trigger point)."""
+    id: int
+    name: str
+    operator: Optional[str] = None
+    threshold_value: Optional[float] = None
+    duration_seconds: int = 0
+    severity: AlertSeverity = AlertSeverity.WARNING
+
+
+class LiveSensorItem(BaseModel):
+    """A sensor definition merged with its latest live reading and thresholds."""
+    sensor_type: str
+    name: str
+    unit: Optional[str] = None
+    value: Optional[float] = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    warning_threshold: Optional[float] = None
+    critical_threshold: Optional[float] = None
+    direction: str = "high"      # "high" = high-is-bad, "low" = low-is-bad
+    status: str = "offline"      # ok | warning | critical | offline
+    rules: List[TriggerRuleInfo] = []
+
+
+class VehicleLiveItem(BaseModel):
+    """A vehicle with its full live sensor telemetry for the dashboard."""
+    id: int
+    name: str
+    imei: str
+    license_plate: Optional[str] = None
+    health: AssetHealth
+    last_seen: Optional[datetime] = None
+    ignition: Optional[bool] = None
+    speed: Optional[float] = None
+    telemetry_timestamp: Optional[str] = None
+    active_alert_count: int = 0
+    open_work_order_count: int = 0
+    sensors: List[LiveSensorItem] = []
+
+
 # =============================================================================
 # Maintenance History
 # =============================================================================
