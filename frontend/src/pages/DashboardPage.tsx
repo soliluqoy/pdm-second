@@ -1,20 +1,15 @@
 /**
  * PREDICT — Dashboard Page
- * Fleet summary cards + live telemetry grid: every running sensor with its
- * current reading, thresholds, and trigger points, updated via WebSocket.
+ * Fleet summary + live sensor telemetry grid.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  Activity,
-  AlertTriangle,
-  ClipboardList,
-  Eye,
-  Radio,
-  Truck,
-} from 'lucide-react';
 import { api } from '../api/client';
 import SensorDetailDrawer from '../components/dashboard/SensorDetailDrawer';
 import VehicleTelemetryCard from '../components/dashboard/VehicleTelemetryCard';
+import Badge from '../components/ui/Badge';
+import PageHeader from '../components/ui/PageHeader';
+import StatCard from '../components/ui/StatCard';
+import EmptyState from '../components/ui/EmptyState';
 import type {
   DashboardSummary,
   LiveSensorItem,
@@ -41,7 +36,6 @@ export default function DashboardPage({ wsMessages }: Props) {
   const lastWsIdx = useRef(0);
   const refreshTimer = useRef<number | null>(null);
 
-  // ── Data fetching ──────────────────────────────────────────────────
   const fetchData = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try {
@@ -60,24 +54,20 @@ export default function DashboardPage({ wsMessages }: Props) {
 
   useEffect(() => {
     fetchData(true);
-    // Slow fallback poll — WS telemetry handles the fast path
     const interval = setInterval(() => fetchData(), 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // 1s ticker for relative "last update" labels
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
-  // Debounced full refresh for non-telemetry events (alerts, health, WOs)
   const scheduleRefresh = useCallback(() => {
     if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
     refreshTimer.current = window.setTimeout(() => fetchData(), 1500);
   }, [fetchData]);
 
-  // ── Live WebSocket updates ─────────────────────────────────────────
   const patchTelemetry = useCallback((payload: any) => {
     const vehicleId = payload?.vehicle_id;
     const data = payload?.data;
@@ -129,7 +119,6 @@ export default function DashboardPage({ wsMessages }: Props) {
     lastWsIdx.current = wsMessages.length;
   }, [wsMessages, patchTelemetry, scheduleRefresh]);
 
-  // ── Selected sensor (derived so it stays live) ─────────────────────
   const selectedVehicle = selected
     ? fleet.find((v) => v.id === selected.vehicleId)
     : undefined;
@@ -141,108 +130,69 @@ export default function DashboardPage({ wsMessages }: Props) {
     (v) => v.telemetry_timestamp && now - new Date(v.telemetry_timestamp).getTime() <= 30_000
   ).length;
 
-  // ── Loading skeleton ───────────────────────────────────────────────
   if (loading) {
     return (
-      <div className="p-6 space-y-5">
-        <div className="h-8 w-64 bg-gray-200 rounded-lg animate-pulse" />
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="page-content space-y-4">
+        <div className="h-8 w-48 bg-gray-200 rounded animate-pulse" />
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {[...Array(4)].map((_, i) => (
-            <div key={i} className="h-28 bg-white rounded-xl border border-gray-200 animate-pulse" />
+            <div key={i} className="h-24 bg-gray-200 rounded-lg animate-pulse" />
           ))}
         </div>
-        {[...Array(3)].map((_, i) => (
-          <div key={i} className="h-72 bg-white rounded-xl border border-gray-200 animate-pulse" />
-        ))}
       </div>
     );
   }
 
   return (
-    <div className="p-6">
-      {/* ── Header ─────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Fleet Dashboard</h1>
-          <p className="text-sm text-gray-500">
-            Live sensor telemetry, thresholds, and trigger points across the fleet
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 px-3 py-2 bg-emerald-50 text-emerald-700 rounded-lg border border-emerald-200">
-            <Radio className="w-4 h-4 animate-pulse" />
-            <span className="text-sm font-medium tabular-nums">
-              {onlineCount}/{fleet.length} streaming
-            </span>
-          </div>
-          {summary?.shadow_mode && (
-            <div className="flex items-center gap-2 px-3 py-2 bg-purple-100 text-purple-800 rounded-lg border border-purple-300">
-              <Eye className="w-4 h-4" />
-              <span className="text-sm font-medium">Shadow Mode</span>
-            </div>
-          )}
-        </div>
-      </div>
+    <div className="page-content">
+      <PageHeader
+        title="Dashboard"
+        description="Fleet health, alerts, and live sensor readings"
+        actions={
+          <>
+            <Badge tone={onlineCount > 0 ? 'success' : 'neutral'}>
+              {onlineCount} of {fleet.length} live
+            </Badge>
+            {summary?.shadow_mode && <Badge tone="purple">Shadow mode on</Badge>}
+          </>
+        }
+      />
 
-      {/* ── Summary Cards ──────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <SummaryCard
-          icon={<Truck className="w-6 h-6 text-predict-600" />}
-          iconBg="bg-predict-50"
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <StatCard
+          label="Vehicles"
           value={summary?.total_vehicles ?? 0}
-          label="Total Vehicles"
-          sub={
-            <div className="flex gap-2 text-xs">
-              {([
-                ['bg-emerald-500', summary?.green_count],
-                ['bg-amber-500', summary?.yellow_count],
-                ['bg-red-500', summary?.red_count],
-                ['bg-gray-400', summary?.grey_count],
-              ] as const).map(([cls, n], i) => (
-                <span key={i} className="flex items-center gap-1">
-                  <span className={`w-2 h-2 rounded-full ${cls}`} />
-                  {n ?? 0}
-                </span>
-              ))}
-            </div>
+          detail={
+            <span>
+              {summary?.green_count ?? 0} healthy · {summary?.yellow_count ?? 0} warning ·{' '}
+              {summary?.red_count ?? 0} critical · {summary?.grey_count ?? 0} unknown
+            </span>
           }
         />
-        <SummaryCard
-          icon={<AlertTriangle className="w-6 h-6 text-red-600" />}
-          iconBg="bg-red-50"
+        <StatCard
+          label="Active alerts"
           value={summary?.active_alerts ?? 0}
-          label="Active Alerts"
-          sub={<p className="text-xs text-red-600">{summary?.critical_alerts ?? 0} critical</p>}
+          detail={`${summary?.critical_alerts ?? 0} critical`}
         />
-        <SummaryCard
-          icon={<ClipboardList className="w-6 h-6 text-blue-600" />}
-          iconBg="bg-blue-50"
+        <StatCard
+          label="Open work orders"
           value={summary?.open_work_orders ?? 0}
-          label="Open Work Orders"
-          sub={<p className="text-xs text-blue-600">{summary?.in_progress_work_orders ?? 0} in progress</p>}
+          detail={`${summary?.in_progress_work_orders ?? 0} in progress`}
         />
-        <SummaryCard
-          icon={<Eye className="w-6 h-6 text-purple-600" />}
-          iconBg="bg-purple-50"
+        <StatCard
+          label="Shadow work orders"
           value={summary?.shadow_work_orders ?? 0}
-          label="Shadow Work Orders"
-          sub={<p className="text-xs text-purple-600">Pending review</p>}
+          detail="Pending review"
         />
       </div>
 
-      {/* ── Live Telemetry ─────────────────────────────────────────── */}
-      <div className="flex items-center gap-2 mb-4">
-        <Activity className="w-5 h-5 text-predict-600" />
-        <h2 className="text-lg font-semibold text-gray-900">Live Sensor Telemetry</h2>
-        <span className="text-xs text-gray-400">— every sensor, its reading, and trigger points</span>
-      </div>
+      <h2 className="section-title">Live telemetry</h2>
+      <p className="text-sm text-gray-600 mb-4">Click a sensor for history and thresholds.</p>
 
       {fleet.length === 0 ? (
-        <div className="bg-white rounded-xl border border-gray-200 py-16 text-center text-gray-400">
-          No vehicles found. Ensure the simulator is running.
-        </div>
+        <EmptyState message="No vehicles found. Start the simulator to see live data." />
       ) : (
-        <div className="grid grid-cols-1 2xl:grid-cols-2 gap-5">
+        <div className="space-y-4">
           {fleet.map((v) => (
             <VehicleTelemetryCard
               key={v.id}
@@ -254,7 +204,6 @@ export default function DashboardPage({ wsMessages }: Props) {
         </div>
       )}
 
-      {/* ── Sensor detail drawer ───────────────────────────────────── */}
       {selectedVehicle && selectedSensor && (
         <SensorDetailDrawer
           vehicle={selectedVehicle}
@@ -262,32 +211,6 @@ export default function DashboardPage({ wsMessages }: Props) {
           onClose={() => setSelected(null)}
         />
       )}
-    </div>
-  );
-}
-
-// ── Summary card ─────────────────────────────────────────────────────────────
-function SummaryCard({
-  icon,
-  iconBg,
-  value,
-  label,
-  sub,
-}: {
-  icon: React.ReactNode;
-  iconBg: string;
-  value: number;
-  label: string;
-  sub: React.ReactNode;
-}) {
-  return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 hover:shadow-md transition-shadow">
-      <div className="flex items-center justify-between mb-3">
-        <div className={`p-2 ${iconBg} rounded-lg`}>{icon}</div>
-        <span className="text-3xl font-bold text-gray-900 tabular-nums">{value}</span>
-      </div>
-      <p className="text-sm text-gray-500">{label}</p>
-      <div className="mt-2">{sub}</div>
     </div>
   );
 }

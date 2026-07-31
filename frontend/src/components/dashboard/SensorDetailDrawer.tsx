@@ -19,9 +19,8 @@ import { AlertTriangle, X } from 'lucide-react';
 import { api } from '../../api/client';
 import type { LiveSensorItem, SensorReading, VehicleLiveItem } from '../../types';
 import {
-  directionOperator,
   formatSensorValue,
-  sensorIcon,
+  directionOperator,
   statusStyles,
 } from '../../utils/sensors';
 
@@ -102,7 +101,6 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
   }, [stats, sensor]);
 
   const styles = statusStyles[sensor.status];
-  const Icon = sensorIcon(sensor.sensor_type);
   const unit = sensor.unit ?? '';
   const op = directionOperator(sensor.direction);
   const gradientId = `grad-${sensor.sensor_type}`;
@@ -112,48 +110,38 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/30 backdrop-blur-[1px]" onClick={onClose} />
 
-      {/* Panel */}
-      <div className="relative w-full sm:w-[540px] h-full bg-white shadow-2xl overflow-y-auto animate-[slideIn_0.2s_ease-out]">
-        {/* Header */}
+      <div className="relative w-full sm:w-[520px] h-full bg-white border-l border-gray-200 shadow-xl overflow-y-auto animate-[slideIn_0.2s_ease-out]">
         <div className="sticky top-0 z-10 bg-white border-b border-gray-200 px-5 py-4 flex items-start justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-predict-50 rounded-lg">
-              <Icon className="w-5 h-5 text-predict-600" />
-            </div>
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900">{sensor.name}</h2>
-              <p className="text-sm text-gray-500">
-                {vehicle.name} · {vehicle.license_plate ?? vehicle.imei}
-              </p>
-            </div>
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">{sensor.name}</h2>
+            <p className="text-sm text-gray-600 mt-0.5">
+              {vehicle.name} · {vehicle.license_plate ?? vehicle.imei}
+            </p>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+            className="btn-secondary px-2 py-2"
             title="Close (Esc)"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 space-y-5">
           {/* Current value + status */}
-          <div className={`rounded-xl border p-4 flex items-center justify-between ${styles.border} ${styles.tileBg}`}>
+          <div className={`panel p-4 flex items-center justify-between ${styles.border} ${styles.tileBg}`}>
             <div>
-              <p className="text-xs text-gray-500 mb-0.5">Current reading</p>
-              <p className="text-3xl font-bold text-gray-900 tabular-nums">
+              <p className="text-sm text-gray-600">Current reading</p>
+              <p className="text-3xl font-semibold text-gray-900 tabular-nums mt-1">
                 {formatSensorValue(sensor.value)}
-                <span className="text-base font-medium text-gray-500 ml-1">{unit}</span>
+                <span className="text-base font-normal text-gray-500 ml-1">{unit}</span>
               </p>
             </div>
-            <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${styles.badge}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${styles.dot}`} />
-              {styles.label}
-            </span>
+            <span className={`text-sm font-medium ${styles.text}`}>{styles.label}</span>
           </div>
 
           {/* History chart */}
-          <div className="rounded-xl border border-gray-200 p-4">
+          <div className="panel p-4">
             <h3 className="text-sm font-semibold text-gray-900 mb-3">Last 60 minutes</h3>
             {loading ? (
               <div className="h-56 flex items-center justify-center text-sm text-gray-400 animate-pulse">
@@ -230,8 +218,8 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
           )}
 
           {/* Thresholds */}
-          <div className="rounded-xl border border-gray-200 p-4">
-            <h3 className="text-sm font-semibold text-gray-900 mb-2">Operating thresholds</h3>
+          <div className="panel p-4">
+            <h3 className="text-sm font-semibold text-gray-900 mb-2">Thresholds</h3>
             <div className="grid grid-cols-2 gap-2 text-sm">
               <div className="flex justify-between rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
                 <span className="text-amber-800">Warning trigger</span>
@@ -255,9 +243,9 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
           </div>
 
           {/* Trigger rules */}
-          <div className="rounded-xl border border-gray-200 p-4">
+          <div className="panel p-4">
             <h3 className="text-sm font-semibold text-gray-900 mb-2">
-              Active trigger rules ({sensor.rules.length})
+              Trigger rules ({sensor.rules.length})
             </h3>
             {sensor.rules.length === 0 ? (
               <p className="text-sm text-gray-400">No rules fire on this sensor.</p>

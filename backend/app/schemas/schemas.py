@@ -43,9 +43,11 @@ class FleetUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class FleetOut(ORMBase):
+class FleetOut(FleetBase, ORMBase):
     id: int
     vehicle_count: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
@@ -79,7 +81,7 @@ class VehicleUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class VehicleOut(ORMBase):
+class VehicleOut(VehicleBase, ORMBase):
     id: int
     health: AssetHealth
     last_seen: Optional[datetime] = None
@@ -87,6 +89,8 @@ class VehicleOut(ORMBase):
     component_count: Optional[int] = None
     active_alert_count: Optional[int] = None
     open_work_order_count: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
@@ -108,10 +112,12 @@ class ComponentUpdate(BaseModel):
     description: Optional[str] = None
 
 
-class ComponentOut(ORMBase):
+class ComponentOut(ComponentBase, ORMBase):
     id: int
     vehicle_id: int
     sensor_count: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
@@ -145,9 +151,11 @@ class SensorUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class SensorOut(ORMBase):
+class SensorOut(SensorBase, ORMBase):
     id: int
     component_id: int
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
@@ -189,8 +197,10 @@ class RuleUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class RuleOut(ORMBase):
+class RuleOut(RuleBase, ORMBase):
     id: int
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
@@ -208,8 +218,10 @@ class WorkOrderTemplateCreate(WorkOrderTemplateBase):
     pass
 
 
-class WorkOrderTemplateOut(ORMBase):
+class WorkOrderTemplateOut(WorkOrderTemplateBase, ORMBase):
     id: int
+    created_at: datetime
+    updated_at: datetime
 
 
 # =============================================================================
