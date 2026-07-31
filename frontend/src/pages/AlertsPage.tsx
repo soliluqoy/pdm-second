@@ -1,10 +1,11 @@
 /**
  * PREDICT — Alerts Page
  * List, filter, acknowledge, and resolve alerts.
+ * Auto-refreshes via WebSocket events and 10s polling fallback.
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { Alert } from '../types';
+import type { Alert, WSMessage } from '../types';
 import { Bell, CheckCircle, XCircle, Filter, AlertTriangle } from 'lucide-react';
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -20,15 +21,21 @@ const STATUS_COLORS: Record<string, string> = {
   suppressed: 'bg-gray-50 text-gray-600',
 };
 
-export default function AlertsPage() {
+interface Props {
+  wsMessages: WSMessage[];
+}
+
+export default function AlertsPage({ wsMessages }: Props) {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterStatus, setFilterStatus] = useState('active');
   const [filterSeverity, setFilterSeverity] = useState('');
+  const lastWsIdx = useRef(0);
+  const refreshTimer = useRef<number | null>(null);
 
   const fetchAlerts = useCallback(async () => {
     try {
-      const params: any = {};
+      const params: { status?: string; severity?: string } = {};
       if (filterStatus) params.status = filterStatus;
       if (filterSeverity) params.severity = filterSeverity;
       const a = await api.getAlerts(params);
@@ -40,9 +47,25 @@ export default function AlertsPage() {
     }
   }, [filterStatus, filterSeverity]);
 
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => fetchAlerts(), 1000);
+  }, [fetchAlerts]);
+
   useEffect(() => {
     fetchAlerts();
+    const interval = setInterval(fetchAlerts, 10_000);
+    return () => clearInterval(interval);
   }, [fetchAlerts]);
+
+  useEffect(() => {
+    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
+      if (wsMessages[i].channel === 'ws:alerts') {
+        scheduleRefresh();
+      }
+    }
+    lastWsIdx.current = wsMessages.length;
+  }, [wsMessages, scheduleRefresh]);
 
   const handleAcknowledge = async (id: number) => {
     try {

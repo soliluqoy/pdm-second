@@ -165,6 +165,12 @@ SEED_RULES = [
     {"name": "DTC P0171 - Lean", "description": "System too lean (Bank 1)",
      "rule_type": RuleType.DTC, "dtc_code": "P0171",
      "severity": AlertSeverity.WARNING, "work_order_template": "DTC Diagnostic"},
+    {"name": "DTC P0500 - Speed Sensor", "description": "Vehicle Speed Sensor malfunction",
+     "rule_type": RuleType.DTC, "dtc_code": "P0500",
+     "severity": AlertSeverity.WARNING, "work_order_template": "DTC Diagnostic"},
+    {"name": "DTC P0115 - Coolant Circuit", "description": "Engine Coolant Temperature Circuit malfunction",
+     "rule_type": RuleType.DTC, "dtc_code": "P0115",
+     "severity": AlertSeverity.CRITICAL, "work_order_template": "DTC Diagnostic"},
 ]
 
 SEED_USERS = [

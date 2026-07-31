@@ -15,15 +15,16 @@ export function useWebSocket(onMessage?: MessageHandler) {
   const [lastMessage, setLastMessage] = useState<WSMessage | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<number | null>(null);
+  const intentionalClose = useRef(false);
   const handlerRef = useRef(onMessage);
 
-  // Update handler ref without re-running effect
   useEffect(() => {
     handlerRef.current = onMessage;
   }, [onMessage]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    intentionalClose.current = false;
 
     try {
       const ws = new WebSocket(WS_URL);
@@ -50,15 +51,18 @@ export function useWebSocket(onMessage?: MessageHandler) {
 
       ws.onclose = () => {
         setConnected(false);
+        wsRef.current = null;
+        if (intentionalClose.current) return;
         console.log('[WS] Disconnected, will retry in 3s...');
-        // Auto-reconnect
         reconnectTimer.current = window.setTimeout(() => {
           connect();
         }, 3000);
       };
     } catch (e) {
       console.error('[WS] Connection failed:', e);
-      reconnectTimer.current = window.setTimeout(() => connect(), 3000);
+      if (!intentionalClose.current) {
+        reconnectTimer.current = window.setTimeout(() => connect(), 3000);
+      }
     }
   }, []);
 
@@ -66,11 +70,14 @@ export function useWebSocket(onMessage?: MessageHandler) {
     connect();
 
     return () => {
+      intentionalClose.current = true;
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
       }
       if (wsRef.current) {
         wsRef.current.close();
+        wsRef.current = null;
       }
     };
   }, [connect]);

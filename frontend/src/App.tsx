@@ -90,8 +90,8 @@ function App() {
         <Routes>
           <Route path="/" element={<DashboardPage wsMessages={wsMessages} />} />
           <Route path="/assets" element={<AssetsPage />} />
-          <Route path="/workorders" element={<WorkOrdersPage />} />
-          <Route path="/alerts" element={<AlertsPage />} />
+          <Route path="/workorders" element={<WorkOrdersPage wsMessages={wsMessages} />} />
+          <Route path="/alerts" element={<AlertsPage wsMessages={wsMessages} />} />
           <Route path="/rules" element={<RulesPage />} />
         </Routes>
       </main>

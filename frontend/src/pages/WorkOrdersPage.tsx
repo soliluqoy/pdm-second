@@ -3,9 +3,9 @@
  * List, filter, assign, and complete work orders.
  * Includes the technician "Mark as Complete" feedback loop.
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { WorkOrder, WorkOrderStatus, WorkOrderPriority } from '../types';
+import type { WorkOrder, WorkOrderStatus, WSMessage } from '../types';
 import {
   ClipboardList,
   UserPlus,
@@ -31,7 +31,7 @@ const PRIORITY_COLORS: Record<string, string> = {
   low: 'bg-gray-400 text-white',
 };
 
-export default function WorkOrdersPage() {
+export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[] }) {
   const [workOrders, setWorkOrders] = useState<WorkOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterStatus, setFilterStatus] = useState<string>('');
@@ -39,6 +39,8 @@ export default function WorkOrdersPage() {
   const [showCompleteModal, setShowCompleteModal] = useState(false);
   const [completedBy, setCompletedBy] = useState('tech1');
   const [completionNotes, setCompletionNotes] = useState('');
+  const lastWsIdx = useRef(0);
+  const refreshTimer = useRef<number | null>(null);
 
   const fetchWorkOrders = useCallback(async () => {
     try {
@@ -52,9 +54,25 @@ export default function WorkOrdersPage() {
     }
   }, [filterStatus]);
 
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => fetchWorkOrders(), 1000);
+  }, [fetchWorkOrders]);
+
   useEffect(() => {
     fetchWorkOrders();
+    const interval = setInterval(fetchWorkOrders, 10_000);
+    return () => clearInterval(interval);
   }, [fetchWorkOrders]);
+
+  useEffect(() => {
+    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
+      if (wsMessages[i].channel === 'ws:workorders') {
+        scheduleRefresh();
+      }
+    }
+    lastWsIdx.current = wsMessages.length;
+  }, [wsMessages, scheduleRefresh]);
 
   const handleAssign = async (id: number) => {
     try {

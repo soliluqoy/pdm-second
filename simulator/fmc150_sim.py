@@ -95,7 +95,15 @@ class VehicleSimulator:
                 "high_coolant_temp", "high_rpm", "low_fuel",
                 "low_battery", "high_engine_load", "low_tire_pressure"
             ])
-            self.anomaly_duration = random.randint(3, 10)  # cycles
+            duration_map = {
+                "high_coolant_temp": random.randint(35, 45),
+                "high_rpm": random.randint(8, 12),
+                "low_battery": random.randint(8, 12),
+                "high_engine_load": random.randint(35, 45),
+                "low_tire_pressure": random.randint(3, 6),
+                "low_fuel": random.randint(3, 6),
+            }
+            self.anomaly_duration = duration_map[self.anomaly_type]
             logger.warning("Injecting anomaly '%s' into %s for %d cycles",
                            self.anomaly_type, self.name, self.anomaly_duration)
 
@@ -125,7 +133,6 @@ class VehicleSimulator:
             rpm = int(random.gauss(5600, 200))  # > critical threshold
         elif self.anomaly_type == "low_fuel":
             self.fuel_level = max(5, self.fuel_level - 2)
-            fuel_level = self.fuel_level
         elif self.anomaly_type == "low_battery":
             battery_voltage = random.gauss(11.2, 0.2)  # < critical threshold
         elif self.anomaly_type == "high_engine_load":
@@ -138,10 +145,21 @@ class VehicleSimulator:
             self.odometer += speed / 3600 * PUBLISH_INTERVAL  # km per interval
             self.engine_hours += PUBLISH_INTERVAL / 3600
 
-        # Fuel consumption
+        # Fuel consumption + refuel simulation
         if self.ignition:
             self.fuel_level = max(0, self.fuel_level - random.uniform(0.05, 0.15))
+        if self.fuel_level < 15:
+            self.fuel_level = random.uniform(70, 95)
+            logger.info("Simulated refuel for %s → %.1f%%", self.name, self.fuel_level)
         fuel_level = self.fuel_level
+
+        # Ignition cycles: occasionally turn off when stopped
+        if self.ignition and speed == 0 and random.random() < 0.05:
+            self.ignition = False
+            logger.info("Ignition OFF for %s", self.name)
+        elif not self.ignition and random.random() < 0.3:
+            self.ignition = True
+            logger.info("Ignition ON for %s", self.name)
 
         # GPS drift (simulate movement)
         if self.ignition and speed > 0:

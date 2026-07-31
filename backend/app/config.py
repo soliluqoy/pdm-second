@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "PREDICT"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
+    SQL_ECHO: bool = False
 
     # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL: str = (

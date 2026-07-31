@@ -123,7 +123,9 @@ async def assign_work_order(wo_id: int, data: WorkOrderAssign, db: AsyncSession 
     wo.assigned_at = datetime.now(timezone.utc)
     wo.status = WorkOrderStatus.IN_PROGRESS
     await db.flush()
-    return await _wo_to_out(db, wo)
+    out = await _wo_to_out(db, wo)
+    await publish_work_order(out.model_dump(mode="json"))
+    return out
 
 
 @router.post("/{wo_id}/complete", response_model=WorkOrderOut)
@@ -162,7 +164,9 @@ async def complete_work_order(wo_id: int, data: WorkOrderComplete, db: AsyncSess
             alert.status = AlertStatus.RESOLVED
 
     await db.flush()
-    return await _wo_to_out(db, wo)
+    out = await _wo_to_out(db, wo)
+    await publish_work_order(out.model_dump(mode="json"))
+    return out
 
 
 @router.post("/{wo_id}/close", response_model=WorkOrderOut)
@@ -176,7 +180,9 @@ async def close_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Only completed work orders can be closed")
     wo.status = WorkOrderStatus.CLOSED
     await db.flush()
-    return await _wo_to_out(db, wo)
+    out = await _wo_to_out(db, wo)
+    await publish_work_order(out.model_dump(mode="json"))
+    return out
 
 
 @router.post("/{wo_id}/cancel", response_model=WorkOrderOut)

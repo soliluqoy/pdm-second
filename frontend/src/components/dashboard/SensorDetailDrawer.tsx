@@ -52,7 +52,7 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
     api
       .getVehicleReadings(vehicle.id, sensor.sensor_type, 1)
       .then((data) => {
-        if (!cancelled) setReadings(data as SensorReading[]);
+        if (!cancelled) setReadings(data);
       })
       .catch((e) => console.error('Failed to load readings:', e))
       .finally(() => !cancelled && setLoading(false));

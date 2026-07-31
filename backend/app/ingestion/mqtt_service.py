@@ -21,6 +21,7 @@ from app.config import settings
 from app.db.database import async_session_factory
 from app.db.models import SensorReading, Vehicle, AssetHealth
 from app.db.redis_client import set_vehicle_state, publish_telemetry, publish_health_update
+from app.rules.engine import evaluate_dtc, evaluate_telemetry
 
 logger = logging.getLogger("predict.ingestion")
 
@@ -140,7 +141,8 @@ class MQTTIngestionService:
             vehicle.last_seen = ts
 
             # Update health to GREEN if was GREY (first data)
-            if vehicle.health == AssetHealth.GREY:
+            was_grey = vehicle.health == AssetHealth.GREY
+            if was_grey:
                 vehicle.health = AssetHealth.GREEN
 
             await session.commit()
@@ -161,12 +163,11 @@ class MQTTIngestionService:
             # Publish telemetry event for WebSocket
             await publish_telemetry(vehicle.id, state)
 
-            # Trigger rule engine (Phase 2)
+            if was_grey:
+                await publish_health_update(vehicle.id, AssetHealth.GREEN.value)
+
             try:
-                from app.rules.engine import evaluate_telemetry
                 await evaluate_telemetry(vehicle.id, imei, sensors, ts)
-            except ImportError:
-                pass  # Rule engine not yet implemented (Phase 1)
             except Exception as e:
                 logger.error("Rule engine error: %s", e)
 
@@ -191,12 +192,8 @@ class MQTTIngestionService:
             logger.info("DTC received: vehicle=%s IMEI=%s code=%s desc=%s",
                         vehicle.name, imei, dtc_code, description)
 
-            # Trigger DTC rule evaluation (Phase 2)
             try:
-                from app.rules.engine import evaluate_dtc
                 await evaluate_dtc(vehicle.id, imei, dtc_code, description, severity)
-            except ImportError:
-                pass
             except Exception as e:
                 logger.error("DTC rule engine error: %s", e)
 

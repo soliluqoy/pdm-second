@@ -2,6 +2,21 @@
  * PREDICT — API Client
  * Centralized fetch wrapper for all backend REST endpoints.
  */
+import type {
+  Alert,
+  Component,
+  DashboardSummary,
+  Fleet,
+  MaintenanceHistory,
+  Rule,
+  Sensor,
+  SensorReading,
+  Vehicle,
+  VehicleHealthItem,
+  VehicleLiveItem,
+  WorkOrder,
+  WorkOrderTemplate,
+} from '../types';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const API_PREFIX = '/api/v1';
@@ -42,30 +57,32 @@ class ApiClient {
 
   // ── Dashboard ──────────────────────────────────────────────────────────────
   getDashboardSummary() {
-    return this.request<any>('/dashboard/summary');
+    return this.request<DashboardSummary>('/dashboard/summary');
   }
 
   getFleetHealth() {
-    return this.request<any[]>('/dashboard/health');
+    return this.request<VehicleHealthItem[]>('/dashboard/health');
   }
 
   getFleetLive() {
-    return this.request<import('../types').VehicleLiveItem[]>('/dashboard/fleet/live');
+    return this.request<VehicleLiveItem[]>('/dashboard/fleet/live');
   }
 
   getVehicleReadings(vehicleId: number, sensorType?: string, hours = 1) {
     const params = new URLSearchParams({ hours: String(hours) });
     if (sensorType) params.set('sensor_type', sensorType);
-    return this.request<any[]>(`/dashboard/vehicles/${vehicleId}/readings?${params}`);
+    return this.request<SensorReading[]>(`/dashboard/vehicles/${vehicleId}/readings?${params}`);
   }
 
   getVehicleLatest(vehicleId: number) {
-    return this.request<Record<string, any>>(`/dashboard/vehicles/${vehicleId}/latest`);
+    return this.request<Record<string, { value: number; unit: string; timestamp: string }>>(
+      `/dashboard/vehicles/${vehicleId}/latest`
+    );
   }
 
   // ── Assets ──────────────────────────────────────────────────────────────────
   getFleets() {
-    return this.request<any[]>('/assets/fleets');
+    return this.request<Fleet[]>('/assets/fleets');
   }
 
   getVehicles(params?: { fleet_id?: number; health?: string }) {
@@ -73,19 +90,19 @@ class ApiClient {
     if (params?.fleet_id) query.set('fleet_id', String(params.fleet_id));
     if (params?.health) query.set('health', params.health);
     const q = query.toString();
-    return this.request<any[]>(`/assets/vehicles${q ? '?' + q : ''}`);
+    return this.request<Vehicle[]>(`/assets/vehicles${q ? '?' + q : ''}`);
   }
 
   getVehicle(id: number) {
-    return this.request<any>(`/assets/vehicles/${id}`);
+    return this.request<Vehicle>(`/assets/vehicles/${id}`);
   }
 
   getComponents(vehicleId: number) {
-    return this.request<any[]>(`/assets/vehicles/${vehicleId}/components`);
+    return this.request<Component[]>(`/assets/vehicles/${vehicleId}/components`);
   }
 
   getSensors(componentId: number) {
-    return this.request<any[]>(`/assets/components/${componentId}/sensors`);
+    return this.request<Sensor[]>(`/assets/components/${componentId}/sensors`);
   }
 
   // ── Work Orders ──────────────────────────────────────────────────────────────
@@ -95,35 +112,35 @@ class ApiClient {
     if (params?.priority) query.set('priority', params.priority);
     if (params?.is_shadow !== undefined) query.set('is_shadow', String(params.is_shadow));
     const q = query.toString();
-    return this.request<any[]>(`/workorders${q ? '?' + q : ''}`);
+    return this.request<WorkOrder[]>(`/workorders${q ? '?' + q : ''}`);
   }
 
   getWorkOrder(id: number) {
-    return this.request<any>(`/workorders/${id}`);
+    return this.request<WorkOrder>(`/workorders/${id}`);
   }
 
   assignWorkOrder(id: number, assignedTo: string) {
-    return this.request<any>(`/workorders/${id}/assign`, {
+    return this.request<WorkOrder>(`/workorders/${id}/assign`, {
       method: 'POST',
       body: JSON.stringify({ assigned_to: assignedTo }),
     });
   }
 
   completeWorkOrder(id: number, completedBy: string, notes?: string) {
-    return this.request<any>(`/workorders/${id}/complete`, {
+    return this.request<WorkOrder>(`/workorders/${id}/complete`, {
       method: 'POST',
       body: JSON.stringify({ completed_by: completedBy, completion_notes: notes }),
     });
   }
 
   closeWorkOrder(id: number) {
-    return this.request<any>(`/workorders/${id}/close`, {
+    return this.request<WorkOrder>(`/workorders/${id}/close`, {
       method: 'POST',
     });
   }
 
   cancelWorkOrder(id: number) {
-    return this.request<any>(`/workorders/${id}/cancel`, {
+    return this.request<WorkOrder>(`/workorders/${id}/cancel`, {
       method: 'POST',
     });
   }
@@ -135,15 +152,15 @@ class ApiClient {
     if (params?.severity) query.set('severity', params.severity);
     if (params?.vehicle_id) query.set('vehicle_id', String(params.vehicle_id));
     const q = query.toString();
-    return this.request<any[]>(`/alerts${q ? '?' + q : ''}`);
+    return this.request<Alert[]>(`/alerts${q ? '?' + q : ''}`);
   }
 
   acknowledgeAlert(id: number) {
-    return this.request<any>(`/alerts/${id}/acknowledge`, { method: 'POST' });
+    return this.request<Alert>(`/alerts/${id}/acknowledge`, { method: 'POST' });
   }
 
   resolveAlert(id: number) {
-    return this.request<any>(`/alerts/${id}/resolve`, { method: 'POST' });
+    return this.request<Alert>(`/alerts/${id}/resolve`, { method: 'POST' });
   }
 
   // ── Rules ────────────────────────────────────────────────────────────────────
@@ -152,11 +169,11 @@ class ApiClient {
     if (params?.rule_type) query.set('rule_type', params.rule_type);
     if (params?.is_active !== undefined) query.set('is_active', String(params.is_active));
     const q = query.toString();
-    return this.request<any[]>(`/rules${q ? '?' + q : ''}`);
+    return this.request<Rule[]>(`/rules${q ? '?' + q : ''}`);
   }
 
   getTemplates() {
-    return this.request<any[]>('/rules/templates');
+    return this.request<WorkOrderTemplate[]>('/rules/templates');
   }
 
   // ── System ───────────────────────────────────────────────────────────────────
@@ -173,12 +190,14 @@ class ApiClient {
 
   getMaintenanceHistory(vehicleId?: number) {
     const query = vehicleId ? `?vehicle_id=${vehicleId}` : '';
-    return this.request<any[]>(`/system/history${query}`);
+    return this.request<MaintenanceHistory[]>(`/system/history${query}`);
   }
 
   // ── Health ──────────────────────────────────────────────────────────────────
   getHealth() {
-    return this.request<any>('/health');
+    return this.request<{ status: string; service: string; version: string; shadow_mode: boolean }>(
+      '/health'
+    );
   }
 }
 

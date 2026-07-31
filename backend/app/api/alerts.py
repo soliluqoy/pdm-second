@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.db.redis_client import publish_alert
 from app.db.models import Alert, AlertStatus, Vehicle
 from app.schemas.schemas import AlertOut, MessageOut
 
@@ -70,7 +71,9 @@ async def acknowledge_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Cannot acknowledge alert in status '{alert.status}'")
     alert.status = AlertStatus.ACKNOWLEDGED
     await db.flush()
-    return await _alert_to_out(db, alert)
+    out = await _alert_to_out(db, alert)
+    await publish_alert(out.model_dump(mode="json"))
+    return out
 
 
 @router.post("/{alert_id}/resolve", response_model=AlertOut)
@@ -81,7 +84,9 @@ async def resolve_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.status = AlertStatus.RESOLVED
     await db.flush()
-    return await _alert_to_out(db, alert)
+    out = await _alert_to_out(db, alert)
+    await publish_alert(out.model_dump(mode="json"))
+    return out
 
 
 @router.post("/{alert_id}/suppress", response_model=AlertOut)

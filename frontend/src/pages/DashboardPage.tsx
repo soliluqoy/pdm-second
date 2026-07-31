@@ -113,11 +113,16 @@ export default function DashboardPage({ wsMessages }: Props) {
       const msg = wsMessages[i];
       if (msg.channel === 'ws:telemetry') {
         patchTelemetry(msg.data);
-      } else if (
-        msg.channel === 'ws:alerts' ||
-        msg.channel === 'ws:health' ||
-        msg.channel === 'ws:workorders'
-      ) {
+      } else if (msg.channel === 'ws:health') {
+        const vehicleId = msg.data?.vehicle_id;
+        const health = msg.data?.health;
+        if (vehicleId && health) {
+          setFleet((prev) =>
+            prev.map((v) => (v.id === vehicleId ? { ...v, health } : v))
+          );
+        }
+        scheduleRefresh();
+      } else if (msg.channel === 'ws:alerts' || msg.channel === 'ws:workorders') {
         scheduleRefresh();
       }
     }
