@@ -15,12 +15,15 @@ from app.db.models import (
     Alert,
     AlertStatus,
     MaintenanceHistory,
+    Rule,
+    RuleType,
     Vehicle,
     WorkOrder,
     WorkOrderStatus,
     WorkOrderPriority,
 )
-from app.db.redis_client import publish_alert, publish_work_order
+from app.db.redis_client import get_vehicle_state, publish_alert, publish_work_order
+from app.rules.engine import reset_scheduled_next_due
 from app.schemas.schemas import (
     MessageOut,
     WorkOrderAssign,
@@ -192,15 +195,35 @@ async def complete_work_order(wo_id: int, data: WorkOrderComplete, db: AsyncSess
         title=wo.title,
         description=f"Completed by {data.completed_by}. Notes: {data.completion_notes or 'N/A'}",
         performed_by=data.completed_by,
+        component=data.component,
     )
     db.add(history)
 
-    # If linked alert exists, resolve it
+    # If linked alert exists, resolve it; re-anchor SCHEDULED next_due
+    alert = None
     if wo.alert_id:
         alert_result = await db.execute(select(Alert).where(Alert.id == wo.alert_id))
         alert = alert_result.scalar_one_or_none()
         if alert and alert.status in (AlertStatus.ACTIVE, AlertStatus.ACKNOWLEDGED):
             alert.status = AlertStatus.RESOLVED
+
+        if alert and alert.rule_id:
+            rule = (await db.execute(
+                select(Rule).where(Rule.id == alert.rule_id)
+            )).scalar_one_or_none()
+            if (rule and rule.rule_type == RuleType.SCHEDULED
+                    and rule.interval_value and rule.sensor_type):
+                state = await get_vehicle_state(wo.vehicle_id) or {}
+                sensors = state.get("sensors") or {}
+                reading = sensors.get(rule.sensor_type) or {}
+                try:
+                    current = float(reading.get("value")) if isinstance(reading, dict) else float(reading)
+                except (TypeError, ValueError):
+                    current = None
+                if current is not None:
+                    await reset_scheduled_next_due(
+                        rule.id, wo.vehicle_id, current, float(rule.interval_value)
+                    )
 
     await db.flush()
     out = await _wo_to_out(db, wo)

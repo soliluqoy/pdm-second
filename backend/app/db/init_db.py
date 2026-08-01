@@ -128,6 +128,16 @@ SEED_RULES = [
     {"name": "DTC P0115 - Coolant Circuit", "description": "Engine Coolant Temperature Circuit malfunction",
      "rule_type": RuleType.DTC, "dtc_code": "P0115",
      "severity": AlertSeverity.CRITICAL, "work_order_template": "DTC Diagnostic"},
+    # Scheduled maintenance (odometer interval)
+    {"name": "Scheduled Service 10,000 km", "description": "Service due every 10,000 km of odometer travel",
+     "rule_type": RuleType.SCHEDULED, "sensor_type": "odometer",
+     "interval_value": 10000,
+     "severity": AlertSeverity.WARNING, "work_order_template": "Scheduled Maintenance"},
+    # Behavior: more than 5 harsh-brake events in a day
+    {"name": "Excessive Harsh Braking", "description": "More than 5 harsh-brake events in a calendar day",
+     "rule_type": RuleType.BEHAVIOR, "sensor_type": "harsh_brake",
+     "operator": ">=", "threshold_value": 5, "duration_seconds": 86400,
+     "severity": AlertSeverity.WARNING, "work_order_template": "High RPM Investigation"},
 ]
 
 SEED_USERS = [
@@ -217,6 +227,33 @@ async def _migrate_rule_vehicle_id():
     logger.info("rule vehicle_id migration applied (rules).")
 
 
+async def _migrate_maintenance_component():
+    """Add maintenance_history.component for ML labels."""
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE maintenance_history "
+            "ADD COLUMN IF NOT EXISTS component VARCHAR(50)"
+        ))
+    logger.info("maintenance_history.component migration applied.")
+
+
+async def _migrate_rule_type_enum():
+    """Add new RuleType enum values on existing DBs.
+
+    Historical SAEnum columns store the *member name* (THRESHOLD, DTC,
+    SCHEDULED), not the lowercase Python value — keep that convention.
+    """
+    async with engine.begin() as conn:
+        for value in ("BEHAVIOR", "ANOMALY"):
+            try:
+                await conn.execute(text(
+                    f"ALTER TYPE ruletype ADD VALUE IF NOT EXISTS '{value}'"
+                ))
+            except Exception as e:
+                logger.debug("ruletype enum add %s: %s", value, e)
+    logger.info("ruletype enum migration applied (BEHAVIOR, ANOMALY).")
+
+
 # FK delete behavior. create_all() never alters existing constraints, so
 # re-create them with the correct ON DELETE action on legacy databases.
 # (table, column, referenced_table, on_delete)
@@ -237,6 +274,12 @@ _FK_ONDELETE_SPEC = [
     ("rules", "sensor_id", "sensors", "SET NULL"),
     ("rules", "vehicle_id", "vehicles", "CASCADE"),
     ("rules", "work_order_template_id", "work_order_templates", "SET NULL"),
+    ("trips", "vehicle_id", "vehicles", "CASCADE"),
+    ("driving_events", "vehicle_id", "vehicles", "CASCADE"),
+    ("driving_events", "trip_id", "trips", "SET NULL"),
+    ("driver_scores", "vehicle_id", "vehicles", "CASCADE"),
+    ("sensor_baselines", "vehicle_id", "vehicles", "CASCADE"),
+    ("component_risk", "vehicle_id", "vehicles", "CASCADE"),
 ]
 
 
@@ -285,6 +328,14 @@ async def _migrate_fk_ondelete():
     logger.info("FK ON DELETE migration applied.")
 
 
+async def _ensure_system_config(session, key: str, value: str, description: str) -> None:
+    existing = await session.execute(
+        text("SELECT 1 FROM system_config WHERE key = :k LIMIT 1"), {"k": key}
+    )
+    if existing.scalar() is None:
+        session.add(SystemConfig(key=key, value=value, description=description))
+
+
 async def _migrate_seed_rules_fixup():
     """Data fix on existing databases: retire dormant seeded rules and add
     the FMC150 battery rule (fresh DBs get the corrected SEED_RULES)."""
@@ -311,8 +362,62 @@ async def _migrate_seed_rules_fixup():
                 " 'CAN-reported vehicle battery < 11.5V (FMC150)', 'threshold', "
                 " 'vehicle_battery_voltage', '<', 11.5, 60, 'critical', :tpl, true, now(), now())"
             ), {"tpl": tpl_id})
+
+        # Phase 5/6 config keys + scheduled/behavior seed rules on upgraded DBs.
+        await _ensure_system_config(
+            session, "behavior.speed_limit_kmh", "120",
+            "Fleet speeding threshold (km/h) for Tier-2 behavior detection.")
+        await _ensure_system_config(
+            session, "behavior.idle_minutes", "5",
+            "Minutes of ignition-on + near-zero speed before an idling event.")
+        await _ensure_system_config(
+            session, "behavior.accel_threshold_ms2", "3.0",
+            "|Δv/Δt| (m/s²) above which harsh accel/brake is flagged (derived).")
+        await _ensure_system_config(
+            session, "behavior.high_rpm_threshold", "4000",
+            "RPM while moving above which high_rpm events are derived.")
+        await _ensure_system_config(
+            session, "behavior.score_weights",
+            '{"harsh_accel":8,"harsh_brake":10,"harsh_corner":8,"speeding":6,"idling":3,"high_rpm":4}',
+            "Penalty points per event per 100 km for the daily driving score.")
+
+        sched = await session.execute(text(
+            "SELECT 1 FROM rules WHERE name = 'Scheduled Service 10,000 km' LIMIT 1"
+        ))
+        if sched.scalar() is None:
+            tpl = await session.execute(text(
+                "SELECT id FROM work_order_templates WHERE name = 'Scheduled Maintenance' LIMIT 1"
+            ))
+            tpl_id = tpl.scalar()
+            # ruletype enum stores member NAMES (SCHEDULED), not values.
+            await session.execute(text(
+                "INSERT INTO rules (name, description, rule_type, sensor_type, "
+                " interval_value, severity, work_order_template_id, is_active, "
+                " created_at, updated_at) "
+                "VALUES ('Scheduled Service 10,000 km', "
+                " 'Service due every 10,000 km of odometer travel', 'SCHEDULED', "
+                " 'odometer', 10000, 'WARNING', :tpl, true, now(), now())"
+            ), {"tpl": tpl_id})
+
+        beh = await session.execute(text(
+            "SELECT 1 FROM rules WHERE name = 'Excessive Harsh Braking' LIMIT 1"
+        ))
+        if beh.scalar() is None:
+            tpl = await session.execute(text(
+                "SELECT id FROM work_order_templates WHERE name = 'High RPM Investigation' LIMIT 1"
+            ))
+            tpl_id = tpl.scalar()
+            await session.execute(text(
+                "INSERT INTO rules (name, description, rule_type, sensor_type, operator, "
+                " threshold_value, duration_seconds, severity, work_order_template_id, "
+                " is_active, created_at, updated_at) "
+                "VALUES ('Excessive Harsh Braking', "
+                " 'More than 5 harsh-brake events in a calendar day', 'BEHAVIOR', "
+                " 'harsh_brake', '>=', 5, 86400, 'WARNING', :tpl, true, now(), now())"
+            ), {"tpl": tpl_id})
+
         await session.commit()
-    logger.info("Seed-rule fixup applied (tire rule retired, FMC150 battery rule ensured).")
+    logger.info("Seed-rule fixup applied (Phase 5/6 rules + behavior config ensured).")
 
 
 # ── TimescaleDB lifecycle: compression, retention, continuous aggregates ──────
@@ -393,7 +498,7 @@ async def audit_dormant_rules():
     async with async_session_factory() as session:
         result = await session.execute(text(
             "SELECT r.id, r.name, r.sensor_type FROM rules r "
-            "WHERE r.is_active = true AND r.rule_type = 'threshold' "
+            "WHERE r.is_active = true AND r.rule_type = 'THRESHOLD' "
             "  AND r.sensor_type IS NOT NULL "
             "  AND NOT EXISTS (SELECT 1 FROM sensors s WHERE s.sensor_type = r.sensor_type)"
         ))
@@ -437,6 +542,8 @@ async def init_database():
     await _migrate_device_type()
     await _migrate_sim_phone()
     await _migrate_rule_vehicle_id()
+    await _migrate_maintenance_component()
+    await _migrate_rule_type_enum()
     await _migrate_fk_ondelete()
 
     # Compression / retention / continuous aggregates
@@ -465,6 +572,27 @@ async def seed_database():
         session.add(SystemConfig(
             key="shadow_mode", value="true",
             description="When true, generated work orders are created in shadow status for review.",
+        ))
+        session.add(SystemConfig(
+            key="behavior.speed_limit_kmh", value="120",
+            description="Fleet speeding threshold (km/h) for Tier-2 behavior detection.",
+        ))
+        session.add(SystemConfig(
+            key="behavior.idle_minutes", value="5",
+            description="Minutes of ignition-on + near-zero speed before an idling event.",
+        ))
+        session.add(SystemConfig(
+            key="behavior.accel_threshold_ms2", value="3.0",
+            description="|Δv/Δt| (m/s²) above which harsh accel/brake is flagged (derived).",
+        ))
+        session.add(SystemConfig(
+            key="behavior.high_rpm_threshold", value="4000",
+            description="RPM while moving above which high_rpm events are derived.",
+        ))
+        session.add(SystemConfig(
+            key="behavior.score_weights",
+            value='{"harsh_accel":8,"harsh_brake":10,"harsh_corner":8,"speeding":6,"idling":3,"high_rpm":4}',
+            description="Penalty points per event per 100 km for the daily driving score.",
         ))
 
         # ── Users ──────────────────────────────────────────────────────────────

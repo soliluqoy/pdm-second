@@ -207,6 +207,7 @@ trips never fire phantom alerts.
 | GPRS → **Second Server** | Mode = **Duplicate**, Domain+Port = `<HOST>:5123`, Protocol = **TCP** |
 | Record / send period | 10s / 10s |
 | I/O to enable (priority Low) | Defaults plus OBD PIDs: 30, 31, 32, 35, 36, 37, 39, 41, 42, 48, 51, 53, 58, 60, 256, 281, 402 |
+| Eco driving (optional) | Enable **Green driving** + **Overspeeding** in Configurator so AVL **253 / 254 / 255** are sent — bridge publishes them on `teltonika/{imei}/event` for device-native harsh accel/brake/corner and speeding |
 
 Plugs into the OBD-II port — no wiring. Duplicate mode keeps the primary platform
 working; both servers must ACK before the device clears its buffer.
@@ -220,6 +221,10 @@ working; both servers must ACK before the device clears its buffer.
 | Record / send period | 10s / 10s |
 | Wiring | CAN-H pin 6, CAN-L pin 14; constant +12V + ground; ignition optional |
 | CAN program | Select vehicle from Teltonika compatibility list — GPS/ignition/voltage work on every car; RPM/fuel/coolant need a supported CAN program |
+| Eco driving (optional) | Same as FMC001: enable Green driving + Overspeeding (AVL **253 / 254 / 255**) for device-native behavior events |
+
+Without eco-driving IOs enabled, the backend still derives harsh accel/brake,
+speeding, idle, and high-RPM events from speed/RPM samples (coarser at ~10 s).
 
 ### 3. Verify the pipeline
 

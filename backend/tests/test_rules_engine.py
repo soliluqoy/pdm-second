@@ -1,11 +1,13 @@
 """Unit tests for rule-engine helpers (no DB / Redis required)."""
 from app.rules.engine import (
+    BEHAVIOR_EVENT_TYPES,
     EQUALITY_EPSILON,
     OPERATORS,
     SCHEDULED_SENSOR_TYPES,
     _condition_met,
     _extract_value,
     _rule_applies_to_vehicle,
+    _scheduled_key,
 )
 
 
@@ -46,3 +48,18 @@ def test_rule_vehicle_scope():
 def test_scheduled_sensor_types():
     assert "odometer" in SCHEDULED_SENSOR_TYPES
     assert "engine_hours" in SCHEDULED_SENSOR_TYPES
+
+
+def test_behavior_event_types():
+    assert "harsh_brake" in BEHAVIOR_EVENT_TYPES
+    assert "speeding" in BEHAVIOR_EVENT_TYPES
+    assert "idling" in BEHAVIOR_EVENT_TYPES
+
+
+def test_scheduled_redis_key_shape():
+    assert _scheduled_key(3, 9) == "rule:3:vehicle:9:next_due"
+
+
+def test_behavior_count_threshold():
+    assert _condition_met(5, ">=", 5) is True
+    assert _condition_met(4, ">=", 5) is False

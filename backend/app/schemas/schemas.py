@@ -1,7 +1,7 @@
 """
 PREDICT — Pydantic Schemas (API request/response models)
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -299,6 +299,10 @@ class WorkOrderComplete(BaseModel):
     """Technician completion payload."""
     completed_by: str = Field(..., max_length=100)
     completion_notes: Optional[str] = None
+    component: Optional[str] = Field(
+        None, max_length=50,
+        description="Component type label for ML (engine, electrical, …)",
+    )
 
 
 class WorkOrderAssign(BaseModel):
@@ -444,16 +448,80 @@ class SensorHistoryOut(BaseModel):
 
 
 class TimelineEvent(BaseModel):
-    """Merged vehicle event stream item (alert / work order / maintenance)."""
-    kind: Literal["alert", "work_order", "maintenance"]
+    """Merged vehicle event stream item."""
+    kind: Literal["alert", "work_order", "maintenance", "health", "dtc", "driving"]
     id: int
     timestamp: datetime
     title: str
     description: Optional[str] = None
-    severity: Optional[str] = None     # alerts
-    status: Optional[str] = None       # alerts + work orders
+    severity: Optional[str] = None     # alerts / dtc
+    status: Optional[str] = None       # alerts + work orders + health to_health
     work_order_id: Optional[int] = None
     alert_id: Optional[int] = None
+
+
+# =============================================================================
+# Driving behavior
+# =============================================================================
+class BehaviorScorecard(BaseModel):
+    vehicle_id: int
+    vehicle_name: str
+    license_plate: Optional[str] = None
+    score: Optional[float] = None
+    date: Optional[date] = None
+    trips: int = 0
+    distance_km: float = 0.0
+    idle_ratio: float = 0.0
+    events_per_100km: dict = {}
+
+
+class BehaviorScorePoint(BaseModel):
+    date: date
+    score: float
+    trips: int
+    distance_km: float
+    idle_ratio: float
+    events_per_100km: dict = {}
+
+
+class BehaviorVehicleOut(BaseModel):
+    vehicle_id: int
+    vehicle_name: str
+    scores: List[BehaviorScorePoint]
+    event_breakdown: dict  # event_type → count (window)
+
+
+class DrivingEventOut(ORMBase):
+    id: int
+    vehicle_id: int
+    trip_id: Optional[int] = None
+    ts: datetime
+    event_type: str
+    value: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    source: str
+
+
+class TripOut(ORMBase):
+    id: int
+    vehicle_id: int
+    start_ts: datetime
+    end_ts: Optional[datetime] = None
+    start_odometer: Optional[float] = None
+    end_odometer: Optional[float] = None
+    distance_km: Optional[float] = None
+    duration_seconds: Optional[int] = None
+    max_speed: Optional[float] = None
+    avg_speed: Optional[float] = None
+    fuel_start: Optional[float] = None
+    fuel_end: Optional[float] = None
+    idle_seconds: int = 0
+    is_open: bool = False
+
+
+class TripDetailOut(TripOut):
+    events: List[DrivingEventOut] = []
 
 
 # =============================================================================
@@ -467,6 +535,7 @@ class MaintenanceHistoryOut(ORMBase):
     title: str
     description: Optional[str] = None
     performed_by: Optional[str] = None
+    component: Optional[str] = None
     event_date: datetime
 
 
@@ -508,10 +577,3 @@ class UserOut(UserBase, ORMBase):
 class MessageOut(BaseModel):
     message: str
     detail: Optional[str] = None
-
-
-class PaginatedOut(BaseModel):
-    items: List
-    total: int
-    skip: int
-    limit: int

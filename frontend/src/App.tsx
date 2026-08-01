@@ -10,6 +10,7 @@ import {
   ClipboardList,
   Bell,
   SlidersHorizontal,
+  Gauge,
 } from 'lucide-react';
 import { WsProvider, useWsConnected } from './ws/WsContext';
 import DashboardPage from './pages/DashboardPage';
@@ -18,10 +19,12 @@ import WorkOrdersPage from './pages/WorkOrdersPage';
 import AlertsPage from './pages/AlertsPage';
 import RulesPage from './pages/RulesPage';
 import VehicleDetailPage from './pages/VehicleDetailPage';
+import DrivingPage from './pages/DrivingPage';
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/assets', label: 'Assets', icon: Truck },
+  { to: '/driving', label: 'Driving', icon: Gauge },
   { to: '/workorders', label: 'Work Orders', icon: ClipboardList },
   { to: '/alerts', label: 'Alerts', icon: Bell },
   { to: '/rules', label: 'Rules', icon: SlidersHorizontal },
@@ -110,6 +113,7 @@ function App() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/assets" element={<AssetsPage />} />
               <Route path="/vehicles/:vehicleId" element={<VehicleDetailPage />} />
+              <Route path="/driving" element={<DrivingPage />} />
               <Route path="/workorders" element={<WorkOrdersPage />} />
               <Route path="/alerts" element={<AlertsPage />} />
               <Route path="/rules" element={<RulesPage />} />

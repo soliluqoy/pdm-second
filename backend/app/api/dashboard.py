@@ -4,10 +4,13 @@ Fleet health summary, vehicle health list, live telemetry, time-series sensor
 history (raw + Timescale continuous aggregates), and the merged vehicle
 event timeline.
 """
+import csv
+import io
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,12 +22,15 @@ from app.db.models import (
     AlertStatus,
     AssetHealth,
     Component,
+    DrivingEvent,
+    DtcEvent,
     MaintenanceHistory,
     Rule,
     RuleType,
     Sensor,
     SensorReading,
     Vehicle,
+    VehicleHealthEvent,
     WorkOrder,
     WorkOrderStatus,
 )
@@ -342,7 +348,7 @@ async def get_vehicle_readings(
     return list(reversed(readings))
 
 
-def _pick_resolution(hours: int) -> str:
+def _pick_resolution(hours: float) -> str:
     if hours <= 6:
         return "raw"
     if hours <= 168:          # up to 7 days → 1-minute buckets
@@ -350,21 +356,38 @@ def _pick_resolution(hours: int) -> str:
     return "1h"
 
 
-@router.get("/vehicles/{vehicle_id}/history", response_model=SensorHistoryOut)
-async def get_vehicle_sensor_history(
+def _history_window(
+    hours: int,
+    from_ts: Optional[datetime],
+    to_ts: Optional[datetime],
+) -> Tuple[datetime, datetime, float]:
+    """Resolve [since, until] and span-in-hours. Prefer from/to when both set."""
+    until = to_ts or datetime.now(timezone.utc)
+    if from_ts is not None and to_ts is not None:
+        if from_ts.tzinfo is None:
+            from_ts = from_ts.replace(tzinfo=timezone.utc)
+        if to_ts.tzinfo is None:
+            to_ts = to_ts.replace(tzinfo=timezone.utc)
+        if from_ts >= to_ts:
+            raise HTTPException(status_code=400, detail="'from' must be before 'to'")
+        span_hours = (to_ts - from_ts).total_seconds() / 3600.0
+        return from_ts, to_ts, span_hours
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    span_hours = float(hours)
+    return since, until, span_hours
+
+
+async def _fetch_sensor_history(
+    db: AsyncSession,
     vehicle_id: int,
     sensor_type: str,
-    hours: int = Query(24, ge=1, le=2160),   # up to 90 days
-    resolution: str = Query("auto", pattern="^(auto|raw|1m|1h)$"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Bucketed sensor history served from TimescaleDB continuous aggregates.
-
-    resolution=auto picks raw ≤ 6h, 1-minute buckets ≤ 7 days, hourly beyond.
-    Raw points return min == max == value so the chart contract is uniform.
-    """
-    res = _pick_resolution(hours) if resolution == "auto" else resolution
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since: datetime,
+    until: datetime,
+    span_hours: float,
+    resolution: str,
+    row_limit: int = 5000,
+) -> SensorHistoryOut:
+    res = _pick_resolution(span_hours) if resolution == "auto" else resolution
 
     if res == "raw":
         result = await db.execute(
@@ -373,9 +396,10 @@ async def get_vehicle_sensor_history(
                 SensorReading.vehicle_id == vehicle_id,
                 SensorReading.sensor_type == sensor_type,
                 SensorReading.timestamp >= since,
+                SensorReading.timestamp <= until,
             )
             .order_by(SensorReading.timestamp.asc())
-            .limit(5000)
+            .limit(row_limit)
         )
         points = [
             HistoryPoint(t=t, value=val, min_value=val, max_value=val, count=1)
@@ -389,17 +413,23 @@ async def get_vehicle_sensor_history(
             text(
                 f"SELECT bucket, avg_value, min_value, max_value, sample_count "
                 f"FROM {view} "
-                f"WHERE vehicle_id = :vid AND sensor_type = :stype AND bucket >= :since "
-                f"ORDER BY bucket ASC LIMIT 5000"
+                f"WHERE vehicle_id = :vid AND sensor_type = :stype "
+                f"AND bucket >= :since AND bucket <= :until "
+                f"ORDER BY bucket ASC LIMIT :lim"
             ),
-            {"vid": vehicle_id, "stype": sensor_type, "since": since},
+            {
+                "vid": vehicle_id,
+                "stype": sensor_type,
+                "since": since,
+                "until": until,
+                "lim": row_limit,
+            },
         )
         rows = result.all()
     except Exception:
-        # Aggregate views missing (e.g. fresh DB before policies ran) —
-        # degrade to raw so the chart still renders.
-        return await get_vehicle_sensor_history(
-            vehicle_id, sensor_type, hours=min(hours, 168), resolution="raw", db=db
+        return await _fetch_sensor_history(
+            db, vehicle_id, sensor_type, since, until,
+            min(span_hours, 168.0), "raw", row_limit,
         )
 
     points = [
@@ -409,30 +439,104 @@ async def get_vehicle_sensor_history(
     return SensorHistoryOut(sensor_type=sensor_type, resolution=res, points=points)
 
 
+@router.get("/vehicles/{vehicle_id}/history", response_model=SensorHistoryOut)
+async def get_vehicle_sensor_history(
+    vehicle_id: int,
+    sensor_type: str,
+    hours: int = Query(24, ge=1, le=2160),   # up to 90 days
+    resolution: str = Query("auto", pattern="^(auto|raw|1m|1h)$"),
+    from_ts: Optional[datetime] = Query(None, alias="from"),
+    to_ts: Optional[datetime] = Query(None, alias="to"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bucketed sensor history served from TimescaleDB continuous aggregates.
+
+    Pass both `from` and `to` for a custom window; otherwise use `hours`.
+    resolution=auto picks raw ≤ 6h, 1-minute buckets ≤ 7 days, hourly beyond.
+    """
+    since, until, span_hours = _history_window(hours, from_ts, to_ts)
+    return await _fetch_sensor_history(
+        db, vehicle_id, sensor_type, since, until, span_hours, resolution
+    )
+
+
+@router.get("/vehicles/{vehicle_id}/history/csv")
+async def get_vehicle_sensor_history_csv(
+    vehicle_id: int,
+    sensor_type: str,
+    hours: int = Query(24, ge=1, le=2160),
+    resolution: str = Query("auto", pattern="^(auto|raw|1m|1h)$"),
+    from_ts: Optional[datetime] = Query(None, alias="from"),
+    to_ts: Optional[datetime] = Query(None, alias="to"),
+    db: AsyncSession = Depends(get_db),
+):
+    """CSV export of bucketed (or raw) sensor history. Capped at 50k rows."""
+    since, until, span_hours = _history_window(hours, from_ts, to_ts)
+    history = await _fetch_sensor_history(
+        db, vehicle_id, sensor_type, since, until, span_hours, resolution, row_limit=50_000
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["timestamp", "sensor_type", "value", "min_value", "max_value", "count", "resolution"])
+    for p in history.points:
+        writer.writerow([
+            p.t.isoformat(),
+            history.sensor_type,
+            p.value,
+            p.min_value,
+            p.max_value,
+            p.count,
+            history.resolution,
+        ])
+    buf.seek(0)
+    filename = f"vehicle_{vehicle_id}_{sensor_type}_{history.resolution}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/vehicles/{vehicle_id}/timeline", response_model=List[TimelineEvent])
 async def get_vehicle_timeline(
     vehicle_id: int,
+    skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    """Merged event stream for one vehicle: alerts, work orders, maintenance."""
+    """Merged event stream: alerts, work orders, maintenance, health, DTCs, driving."""
     vehicle = (await db.execute(
         select(Vehicle.id).where(Vehicle.id == vehicle_id)
     )).scalar_one_or_none()
     if vehicle is None:
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
+    # Fetch a generous window per source, then merge/sort/paginate in Python.
+    fetch_n = skip + limit
     alerts = (await db.execute(
         select(Alert).where(Alert.vehicle_id == vehicle_id)
-        .order_by(Alert.created_at.desc()).limit(limit)
+        .order_by(Alert.created_at.desc()).limit(fetch_n)
     )).scalars().all()
     wos = (await db.execute(
         select(WorkOrder).where(WorkOrder.vehicle_id == vehicle_id)
-        .order_by(WorkOrder.created_at.desc()).limit(limit)
+        .order_by(WorkOrder.created_at.desc()).limit(fetch_n)
     )).scalars().all()
     events = (await db.execute(
         select(MaintenanceHistory).where(MaintenanceHistory.vehicle_id == vehicle_id)
-        .order_by(MaintenanceHistory.event_date.desc()).limit(limit)
+        .order_by(MaintenanceHistory.event_date.desc()).limit(fetch_n)
+    )).scalars().all()
+    health_events = (await db.execute(
+        select(VehicleHealthEvent).where(VehicleHealthEvent.vehicle_id == vehicle_id)
+        .order_by(VehicleHealthEvent.timestamp.desc()).limit(fetch_n)
+    )).scalars().all()
+    dtc_events = (await db.execute(
+        select(DtcEvent).where(DtcEvent.vehicle_id == vehicle_id)
+        .order_by(DtcEvent.timestamp.desc()).limit(fetch_n)
+    )).scalars().all()
+    driving_events = (await db.execute(
+        select(DrivingEvent).where(DrivingEvent.vehicle_id == vehicle_id)
+        .order_by(DrivingEvent.ts.desc()).limit(fetch_n)
     )).scalars().all()
 
     timeline: List[TimelineEvent] = []
@@ -453,9 +557,33 @@ async def get_vehicle_timeline(
             description=e.description, status=e.event_type,
             work_order_id=e.work_order_id,
         ))
+    for h in health_events:
+        timeline.append(TimelineEvent(
+            kind="health", id=h.id, timestamp=h.timestamp,
+            title=f"Health {h.from_health.value} → {h.to_health.value}",
+            description=h.reason,
+            status=h.to_health.value,
+        ))
+    for d in dtc_events:
+        timeline.append(TimelineEvent(
+            kind="dtc", id=d.id, timestamp=d.timestamp,
+            title=f"DTC {d.dtc_code}",
+            description=d.description,
+            severity=d.severity,
+            alert_id=d.alert_id,
+        ))
+    for de in driving_events:
+        et = de.event_type.value if hasattr(de.event_type, "value") else str(de.event_type)
+        src = de.source.value if hasattr(de.source, "value") else str(de.source)
+        timeline.append(TimelineEvent(
+            kind="driving", id=de.id, timestamp=de.ts,
+            title=et.replace("_", " ").title(),
+            description=f"{src}" + (f" · value={de.value}" if de.value is not None else ""),
+            status=src,
+        ))
 
     timeline.sort(key=lambda x: x.timestamp, reverse=True)
-    return timeline[:limit]
+    return timeline[skip:skip + limit]
 
 
 @router.get("/vehicles/{vehicle_id}/latest", response_model=dict)

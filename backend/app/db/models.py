@@ -12,6 +12,7 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum as SAEnum,
     Float,
@@ -23,6 +24,7 @@ from sqlalchemy import (
     Index,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -87,6 +89,22 @@ class RuleType(str, enum.Enum):
     THRESHOLD = "threshold"   # value > X or value < Y
     DTC = "dtc"               # diagnostic trouble code match
     SCHEDULED = "scheduled"   # mileage / engine hours interval (odometer, engine_hours)
+    BEHAVIOR = "behavior"     # driving-event count thresholds (harsh brake, speeding, …)
+    ANOMALY = "anomaly"       # statistical baseline deviation / domain PdM detectors
+
+
+class DrivingEventType(str, enum.Enum):
+    HARSH_ACCEL = "harsh_accel"
+    HARSH_BRAKE = "harsh_brake"
+    HARSH_CORNER = "harsh_corner"
+    SPEEDING = "speeding"
+    IDLING = "idling"
+    HIGH_RPM = "high_rpm"
+
+
+class DrivingEventSource(str, enum.Enum):
+    DEVICE = "device"
+    DERIVED = "derived"
 
 
 class UserRole(str, enum.Enum):
@@ -334,7 +352,41 @@ class MaintenanceHistory(Base):
     title = Column(String(200), nullable=False)
     description = Column(Text)
     performed_by = Column(String(100))
+    component = Column(String(50))                      # e.g. engine, electrical — ML label
     event_date = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+
+class VehicleHealthEvent(Base):
+    """Immutable log of vehicle health transitions (for the vehicle timeline)."""
+    __tablename__ = "vehicle_health_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_health = Column(SAEnum(AssetHealth), nullable=False)
+    to_health = Column(SAEnum(AssetHealth), nullable=False)
+    reason = Column(String(100))
+    timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_vehicle_health_events_vehicle_time", "vehicle_id", "timestamp"),
+    )
+
+
+class DtcEvent(Base):
+    """Diagnostic trouble codes received from a tracker (regardless of rule match)."""
+    __tablename__ = "dtc_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    dtc_code = Column(String(20), nullable=False, index=True)
+    description = Column(Text)
+    severity = Column(String(20), default="warning")
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_dtc_events_vehicle_time", "vehicle_id", "timestamp"),
+    )
 
 
 # =============================================================================
@@ -402,4 +454,110 @@ class SensorReading(Base):
     __table_args__ = (
         Index("ix_sensor_readings_time_vehicle", "timestamp", "vehicle_id"),
         Index("ix_sensor_readings_vehicle_sensor_time", "vehicle_id", "sensor_type", "timestamp"),
+    )
+
+
+# =============================================================================
+# Driving behavior (Phase 5)
+# =============================================================================
+
+class Trip(Base):
+    """A driving trip segmented by ignition (or movement/speed fallback)."""
+    __tablename__ = "trips"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    start_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    end_ts = Column(DateTime(timezone=True), nullable=True, index=True)
+    start_odometer = Column(Float)
+    end_odometer = Column(Float)
+    distance_km = Column(Float)
+    duration_seconds = Column(Integer)
+    max_speed = Column(Float)
+    avg_speed = Column(Float)
+    fuel_start = Column(Float)
+    fuel_end = Column(Float)
+    idle_seconds = Column(Integer, default=0, nullable=False)
+    is_open = Column(Boolean, default=True, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_trips_vehicle_start", "vehicle_id", "start_ts"),
+    )
+
+
+class DrivingEvent(Base):
+    """Harsh driving / speeding / idle / high-RPM event (device or derived)."""
+    __tablename__ = "driving_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    trip_id = Column(Integer, ForeignKey("trips.id", ondelete="SET NULL"), nullable=True, index=True)
+    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    event_type = Column(SAEnum(DrivingEventType), nullable=False, index=True)
+    value = Column(Float)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    source = Column(SAEnum(DrivingEventSource), nullable=False, default=DrivingEventSource.DERIVED)
+
+    __table_args__ = (
+        Index("ix_driving_events_vehicle_ts", "vehicle_id", "ts"),
+        Index("ix_driving_events_vehicle_type_ts", "vehicle_id", "event_type", "ts"),
+    )
+
+
+class DriverScore(Base):
+    """Daily per-vehicle driving score (stands in for driver in single-tenant PoC)."""
+    __tablename__ = "driver_scores"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    trips = Column(Integer, default=0, nullable=False)
+    distance_km = Column(Float, default=0.0, nullable=False)
+    events_per_100km = Column(JSONB, default=dict)
+    idle_ratio = Column(Float, default=0.0, nullable=False)
+    score = Column(Float, default=100.0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("date", "vehicle_id", name="uq_driver_scores_date_vehicle"),
+    )
+
+
+# =============================================================================
+# Predictive maintenance foundation (Phase 6)
+# =============================================================================
+
+class SensorBaseline(Base):
+    """Per-vehicle, per-sensor statistical baseline from 1h aggregates."""
+    __tablename__ = "sensor_baselines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    sensor_type = Column(String(50), nullable=False, index=True)
+    window = Column(String(20), nullable=False, default="30d")  # e.g. 30d
+    mean = Column(Float, nullable=False)
+    std = Column(Float, nullable=False)
+    p95 = Column(Float)
+    sample_count = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "sensor_type", "window",
+                         name="uq_sensor_baselines_vehicle_sensor_window"),
+    )
+
+
+class ComponentRisk(Base):
+    """Placeholder for offline ML component risk scores (schema only)."""
+    __tablename__ = "component_risk"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    component = Column(String(50), nullable=False, index=True)
+    risk_score = Column(Float, nullable=False, default=0.0)
+    model_version = Column(String(50))
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "component", name="uq_component_risk_vehicle_component"),
     )

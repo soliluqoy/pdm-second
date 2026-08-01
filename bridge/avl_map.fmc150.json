@@ -3,7 +3,7 @@
     "Maps Teltonika FMC150 (wired CAN tracker) AVL I/O element IDs → PREDICT sensor types.",
     "Per-model file: the bridge picks avl_map.<model>.json by the IMEI→model mapping in BRIDGE_DEVICES (see fmc_bridge.py). Sibling file: avl_map.fmc001.json.",
     "The bridge publishes value = raw * scale + offset.",
-    "kind 'sensor' → payload.sensors[sensor_type]; kind 'meta' → top-level payload field (e.g. ignition, vin); kind 'dtc' → published to teltonika/{imei}/dtc.",
+    "kind 'sensor' → payload.sensors[sensor_type]; kind 'meta' → top-level payload field (e.g. ignition, vin); kind 'dtc' → published to teltonika/{imei}/dtc; kind 'event' → published to teltonika/{imei}/event (eco-driving).",
     "encoding 'ascii' → variable-length (8E X-group) bytes are decoded as ASCII instead of hex (needed for AVL 325 VIN and AVL 282 fault codes).",
     "AVL IDs follow the Teltonika wiki page 'FMC150 Teltonika Data Sending Parameters ID' (CAN I/O standard + extended elements). CAN parameters only arrive if the vehicle is on Teltonika's compatibility list and the correct CAN program number is selected in the Configurator.",
     "sensor_type strings match the FMC001 map wherever the physical quantity is the same (engine_rpm, coolant_temperature, fuel_level, ...) so rules and the dashboard stay device-agnostic. MUST stay in sync with backend/app/services/provisioning.py (FMC150_SENSOR_CATALOG) and backend/app/db/init_db.py (SEED_RULES).",
@@ -37,6 +37,10 @@
     { "id": 160, "sensor_type": "dtc_count",     "name": "DTC Count",               "unit": "",   "kind": "sensor", "scale": 1,     "offset": 0, "_comment": "Number of active diagnostic trouble codes (CAN adapter group)" },
     { "id": 282, "sensor_type": "dtc",           "name": "Fault Codes",             "unit": "",   "kind": "dtc",    "encoding": "ascii", "_comment": "Comma-separated ASCII codes via 8E X-group (LV-CAN200+DTC / CANCONTROL) — bridge splits and publishes each to teltonika/{imei}/dtc" },
     { "id": 400, "sensor_type": "distance_until_service", "name": "Distance Until Service", "unit": "km", "kind": "sensor", "scale": 1, "offset": 0, "_comment": "CAN standard 'Distance till next servicing' — countdown to next scheduled service; only if the car exposes it" },
-    { "id": 866, "sensor_type": "remaining_distance", "name": "Remaining Distance", "unit": "km", "kind": "sensor", "scale": 1,    "offset": 0, "_comment": "CAN standard — range with current tank/battery" }
+    { "id": 866, "sensor_type": "remaining_distance", "name": "Remaining Distance", "unit": "km", "kind": "sensor", "scale": 1,    "offset": 0, "_comment": "CAN standard — range with current tank/battery" },
+
+    { "id": 253, "sensor_type": "green_driving_type",  "name": "Green Driving Type",  "unit": "",  "kind": "event", "scale": 1, "offset": 0, "_comment": "1=harsh accel, 2=harsh brake, 3=harsh corner — enable Eco driving in Configurator" },
+    { "id": 254, "sensor_type": "green_driving_value", "name": "Green Driving Value", "unit": "",  "kind": "event", "scale": 1, "offset": 0, "_comment": "Magnitude paired with AVL 253" },
+    { "id": 255, "sensor_type": "overspeeding",        "name": "Overspeeding",        "unit": "km/h", "kind": "event", "scale": 1, "offset": 0, "_comment": "Device overspeeding event — enable Overspeeding in Configurator" }
   ]
 }

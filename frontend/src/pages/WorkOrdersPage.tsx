@@ -1,15 +1,17 @@
 /**
  * PREDICT — Work Orders Page
  */
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { User, WorkOrder, WorkOrderPriority, WorkOrderStatus } from '../types';
+import type { WorkOrder, WorkOrderPriority, WorkOrderStatus } from '../types';
 import Badge from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import FilterBar from '../components/ui/FilterBar';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { queryKeys } from '../queryClient';
 import { useWsSubscription } from '../ws/WsContext';
 
 const statusTone: Record<string, 'purple' | 'info' | 'warning' | 'success' | 'neutral' | 'danger'> = {
@@ -28,11 +30,10 @@ const priorityTone: Record<string, 'danger' | 'warning' | 'info' | 'neutral'> = 
   low: 'neutral',
 };
 
+const PAGE_SIZE = 50;
+
 export default function WorkOrdersPage() {
-  const [workOrders, setWorkOrders] = useState<WorkOrder[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [shadowMode, setShadowMode] = useState(false);
-  const [users, setUsers] = useState<User[]>([]);
+  const queryClient = useQueryClient();
   const [filterStatus, setFilterStatus] = useState<string>('');
   const [filterPriority, setFilterPriority] = useState<string>('');
   const [selectedWO, setSelectedWO] = useState<WorkOrder | null>(null);
@@ -41,60 +42,85 @@ export default function WorkOrdersPage() {
   const [assignTo, setAssignTo] = useState('');
   const [completedBy, setCompletedBy] = useState('');
   const [completionNotes, setCompletionNotes] = useState('');
-  const refreshTimer = useRef<number | null>(null);
+  const [completionComponent, setCompletionComponent] = useState('');
   const shadowDefaultApplied = useRef(false);
 
-  const fetchWorkOrders = useCallback(async () => {
-    try {
-      const params: { status?: string; priority?: string } = {};
-      if (filterStatus) params.status = filterStatus;
-      if (filterPriority) params.priority = filterPriority;
-      const wos = await api.getWorkOrders(Object.keys(params).length ? params : undefined);
-      setWorkOrders(wos);
-    } catch (e) {
-      console.error('Failed to fetch work orders:', e);
-    } finally {
-      setLoading(false);
+  const COMPONENT_OPTIONS = [
+    '',
+    'engine',
+    'electrical',
+    'connectivity',
+    'maintenance',
+    'brakes',
+    'transmission',
+    'other',
+  ];
+
+  const filters = useMemo(
+    () => ({
+      status: filterStatus || undefined,
+      priority: filterPriority || undefined,
+    }),
+    [filterStatus, filterPriority]
+  );
+
+  const shadowQuery = useQuery({
+    queryKey: queryKeys.shadowMode,
+    queryFn: () => api.getShadowMode(),
+  });
+
+  const usersQuery = useQuery({
+    queryKey: queryKeys.users,
+    queryFn: () => api.getUsers(),
+    staleTime: 60_000,
+  });
+
+  const woQuery = useInfiniteQuery({
+    queryKey: queryKeys.workOrders(filters),
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) =>
+      api.getWorkOrders({
+        ...filters,
+        skip: pageParam,
+        limit: PAGE_SIZE,
+      }),
+    getNextPageParam: (lastPage, allPages) =>
+      lastPage.length === PAGE_SIZE ? allPages.reduce((n, p) => n + p.length, 0) : undefined,
+    refetchInterval: 15_000,
+  });
+
+  const shadowMode = shadowQuery.data?.shadow_mode ?? false;
+  const users = usersQuery.data ?? [];
+  const workOrders = useMemo(() => woQuery.data?.pages.flat() ?? [], [woQuery.data]);
+
+  useEffect(() => {
+    if (shadowMode && !shadowDefaultApplied.current) {
+      shadowDefaultApplied.current = true;
+      setFilterStatus('shadow');
     }
-  }, [filterStatus, filterPriority]);
-
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(() => fetchWorkOrders(), 1000);
-  }, [fetchWorkOrders]);
+  }, [shadowMode]);
 
   useEffect(() => {
-    api.getShadowMode().then((r) => {
-      setShadowMode(r.shadow_mode);
-      if (r.shadow_mode && !shadowDefaultApplied.current) {
-        shadowDefaultApplied.current = true;
-        setFilterStatus('shadow');
-      }
-    }).catch(console.error);
-    api.getUsers().then((u) => {
-      setUsers(u);
-      const firstTech = u.find((x) => x.role === 'technician') ?? u[0];
-      if (firstTech) {
-        setAssignTo(firstTech.username);
-        setCompletedBy(firstTech.username);
-      }
-    }).catch(console.error);
-  }, []);
+    if (!users.length) return;
+    const firstTech = users.find((x) => x.role === 'technician') ?? users[0];
+    if (firstTech) {
+      setAssignTo((prev) => prev || firstTech.username);
+      setCompletedBy((prev) => prev || firstTech.username);
+    }
+  }, [users]);
 
-  useEffect(() => {
-    fetchWorkOrders();
-    const interval = setInterval(fetchWorkOrders, 15_000);
-    return () => clearInterval(interval);
-  }, [fetchWorkOrders]);
+  useWsSubscription(['ws:workorders'], () => {
+    void queryClient.invalidateQueries({ queryKey: ['workorders'] });
+  });
 
-  useWsSubscription(['ws:workorders'], () => scheduleRefresh());
+  const invalidateWOs = () => void queryClient.invalidateQueries({ queryKey: ['workorders'] });
 
   const handleAssign = async () => {
     if (!showAssignFor || !assignTo) return;
     try {
       await api.assignWorkOrder(showAssignFor.id, assignTo);
       setShowAssignFor(null);
-      fetchWorkOrders();
+      invalidateWOs();
     } catch (e) {
       console.error('Failed to assign:', e);
     }
@@ -103,11 +129,17 @@ export default function WorkOrdersPage() {
   const handleComplete = async () => {
     if (!selectedWO) return;
     try {
-      await api.completeWorkOrder(selectedWO.id, completedBy, completionNotes);
+      await api.completeWorkOrder(
+        selectedWO.id,
+        completedBy,
+        completionNotes,
+        completionComponent || undefined
+      );
       setShowCompleteModal(false);
       setCompletionNotes('');
+      setCompletionComponent('');
       setSelectedWO(null);
-      fetchWorkOrders();
+      invalidateWOs();
     } catch (e) {
       console.error('Failed to complete:', e);
     }
@@ -116,7 +148,7 @@ export default function WorkOrdersPage() {
   const handleClose = async (id: number) => {
     try {
       await api.closeWorkOrder(id);
-      fetchWorkOrders();
+      invalidateWOs();
     } catch (e) {
       console.error('Failed to close:', e);
     }
@@ -125,7 +157,7 @@ export default function WorkOrdersPage() {
   const handleCancel = async (id: number) => {
     try {
       await api.cancelWorkOrder(id);
-      fetchWorkOrders();
+      invalidateWOs();
     } catch (e) {
       console.error('Failed to cancel:', e);
     }
@@ -134,7 +166,7 @@ export default function WorkOrdersPage() {
   const handleApprove = async (id: number) => {
     try {
       await api.approveWorkOrder(id);
-      fetchWorkOrders();
+      invalidateWOs();
     } catch (e) {
       console.error('Failed to approve:', e);
     }
@@ -143,7 +175,7 @@ export default function WorkOrdersPage() {
   const statusFilters: (WorkOrderStatus | '')[] = ['', 'shadow', 'open', 'in_progress', 'completed', 'closed'];
   const priorityFilters: (WorkOrderPriority | '')[] = ['', 'urgent', 'high', 'medium', 'low'];
 
-  if (loading) {
+  if (woQuery.isLoading) {
     return <LoadingState message="Loading work orders…" />;
   }
 
@@ -283,6 +315,17 @@ export default function WorkOrdersPage() {
               ))}
             </tbody>
           </table>
+          {woQuery.hasNextPage && (
+            <div className="text-center py-3 border-t border-gray-100">
+              <button
+                onClick={() => void woQuery.fetchNextPage()}
+                disabled={woQuery.isFetchingNextPage}
+                className="btn-secondary"
+              >
+                {woQuery.isFetchingNextPage ? 'Loading…' : 'Load more'}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -305,6 +348,19 @@ export default function WorkOrdersPage() {
                     <option key={u.id} value={u.username}>
                       {u.display_name}
                     </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="filter-label">Component</label>
+                <select
+                  value={completionComponent}
+                  onChange={(e) => setCompletionComponent(e.target.value)}
+                  className="filter-select w-full mt-1"
+                >
+                  <option value="">Not specified</option>
+                  {COMPONENT_OPTIONS.filter(Boolean).map((c) => (
+                    <option key={c} value={c}>{c}</option>
                   ))}
                 </select>
               </div>

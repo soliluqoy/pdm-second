@@ -228,7 +228,7 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
             )}
             <div className="mt-3 text-right">
               <Link
-                to={`/vehicles/${vehicle.id}`}
+                to={`/vehicles/${vehicle.id}?tab=history&sensor=${encodeURIComponent(sensor.sensor_type)}`}
                 className="text-xs text-predict-600 hover:underline"
                 onClick={onClose}
               >

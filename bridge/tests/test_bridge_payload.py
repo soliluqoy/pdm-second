@@ -25,6 +25,13 @@ IMEI_CAN = "350424061234001"
 
 
 def _payload_for(record, model="fmc001", imei=IMEI):
+    """Returns (telemetry, dtcs) for backward-compatible assertions."""
+    records, _ = parse_avl_packet(build_packet([record]))
+    payload, dtcs, _events = record_to_payload(imei, records[0], IO_MAPS[model], model)
+    return payload, dtcs
+
+
+def _full_for(record, model="fmc001", imei=IMEI):
     records, _ = parse_avl_packet(build_packet([record]))
     return record_to_payload(imei, records[0], IO_MAPS[model], model)
 
@@ -87,7 +94,7 @@ def test_fmc001_ascii_entries_are_only_vin_and_dtc():
 def test_unmapped_id_ignored_in_payload():
     payload, _ = _payload_for(build_record(TS_MS, io_1b={200: 1}))  # sleep mode: not mapped
     assert payload["sensors"] == {}
-    assert payload["ignition"] is True  # default until AVL 239 arrives
+    assert payload["ignition"] is None  # unknown until AVL 239 arrives
 
 
 # ── FMC150 (CAN IDs) ──────────────────────────────────────────────────────────
@@ -150,3 +157,29 @@ def test_fmc150_record_does_not_pick_up_fmc001_ids():
     payload, _ = _payload_for(build_record(TS_MS, io_2b={36: 2400}),
                               model="fmc150", imei=IMEI_CAN)
     assert payload["sensors"] == {}
+
+
+# ── Eco-driving / overspeeding events (AVL 253/254/255) ───────────────────────
+def test_green_driving_emits_harsh_brake_event():
+    payload, dtcs, events = _full_for(build_record(
+        TS_MS, io_1b={253: 2, 254: 42},
+    ))
+    assert dtcs == []
+    assert len(events) == 1
+    assert events[0]["event_type"] == "harsh_brake"
+    assert events[0]["value"] == 42
+    assert events[0]["source"] == "device"
+    assert events[0]["imei"] == IMEI
+    assert "green_driving_type" not in payload["sensors"]
+
+
+def test_overspeeding_emits_speeding_event():
+    _, _, events = _full_for(build_record(TS_MS, io_1b={255: 130}))
+    assert len(events) == 1
+    assert events[0]["event_type"] == "speeding"
+    assert events[0]["value"] == 130
+
+
+def test_movement_meta_forwarded_on_payload():
+    payload, _ = _payload_for(build_record(TS_MS, io_1b={240: 1}))
+    assert payload["movement"] is True

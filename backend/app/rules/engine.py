@@ -1,7 +1,8 @@
 """
 PREDICT — Rule Engine
-Evaluates threshold, DTC, and scheduled rules against incoming telemetry.
-Creates alerts + work orders, recomputes vehicle health, broadcasts via Redis pub/sub.
+Evaluates threshold, DTC, scheduled, and behavior rules against incoming
+telemetry / event counts. Creates alerts + work orders, recomputes vehicle
+health, broadcasts via Redis pub/sub.
 
 Performance notes:
 - Active rules are cached in-process (TTL + explicit invalidation from the
@@ -11,16 +12,19 @@ Performance notes:
 """
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import settings
 from app.db.database import async_session_factory
 from app.db.models import (
     Alert,
     AlertStatus,
+    DrivingEvent,
+    DrivingEventType,
+    MaintenanceHistory,
     Rule,
     RuleType,
     Vehicle,
@@ -52,6 +56,9 @@ OPERATORS = {
 
 # Sensor types a SCHEDULED rule can track (monotonically increasing counters).
 SCHEDULED_SENSOR_TYPES = ("odometer", "engine_hours")
+
+# Behavior rules use sensor_type as the driving event type name.
+BEHAVIOR_EVENT_TYPES = tuple(e.value for e in DrivingEventType)
 
 
 # ── In-process rule cache ─────────────────────────────────────────────────────
@@ -341,13 +348,38 @@ def _scheduled_key(rule_id: int, vehicle_id: int) -> str:
     return f"rule:{rule_id}:vehicle:{vehicle_id}:next_due"
 
 
+async def reset_scheduled_next_due(rule_id: int, vehicle_id: int, current_value: float,
+                                   interval_value: float) -> None:
+    """Re-anchor next_due after scheduled maintenance is completed."""
+    await redis_client.set(
+        _scheduled_key(rule_id, vehicle_id),
+        str(current_value + interval_value),
+    )
+
+
+async def _has_completed_scheduled_service(session, rule_id: int, vehicle_id: int) -> bool:
+    """True if a WO from this rule was completed (maintenance_history exists)."""
+    result = await session.execute(
+        select(MaintenanceHistory.id)
+        .join(WorkOrder, WorkOrder.id == MaintenanceHistory.work_order_id)
+        .join(Alert, Alert.id == WorkOrder.alert_id)
+        .where(
+            MaintenanceHistory.vehicle_id == vehicle_id,
+            Alert.rule_id == rule_id,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _evaluate_scheduled_rule(session, rule: Rule, vehicle_id: int,
                                    vehicle_name: str, sensors: dict, ts: datetime) -> None:
     """Interval maintenance on a monotonically increasing counter.
 
     sensor_type must be 'odometer' or 'engine_hours' and interval_value the
     service interval in that unit. First sighting anchors next_due at
-    current + interval; each crossing fires once and re-anchors.
+    current + interval. Completing a scheduled WO re-anchors via
+    ``reset_scheduled_next_due`` (see workorders.complete).
     """
     if (not rule.interval_value or rule.interval_value <= 0
             or rule.sensor_type not in SCHEDULED_SENSOR_TYPES):
@@ -360,7 +392,16 @@ async def _evaluate_scheduled_rule(session, rule: Rule, vehicle_id: int,
     key = _scheduled_key(rule.id, vehicle_id)
     next_due_raw = await redis_client.get(key)
     if next_due_raw is None:
+        # Fresh anchor. If prior scheduled service exists in history the
+        # counter still advances from "now + interval" (we don't store the
+        # odometer at service time); WO completion resets explicitly.
         await redis_client.set(key, str(value + rule.interval_value))
+        if await _has_completed_scheduled_service(session, rule.id, vehicle_id):
+            logger.debug(
+                "Scheduled rule %s vehicle %s: redis empty but history exists — "
+                "anchored at current+interval",
+                rule.id, vehicle_id,
+            )
         return
 
     try:
@@ -391,6 +432,82 @@ async def _evaluate_scheduled_rule(session, rule: Rule, vehicle_id: int,
         )
     # Re-anchor whether or not a duplicate alert was suppressed.
     await redis_client.set(key, str(value + rule.interval_value))
+
+
+# ── Behavior (daily event counts) ─────────────────────────────────────────────
+async def evaluate_behavior_rules(
+    vehicle_id: int,
+    session=None,
+    vehicle_name: Optional[str] = None,
+    ts: Optional[datetime] = None,
+) -> None:
+    """Evaluate BEHAVIOR rules against today's driving-event counts."""
+    if session is not None:
+        await _evaluate_behavior_rules(session, vehicle_id, vehicle_name, ts)
+        return
+    async with async_session_factory() as own_session:
+        await _evaluate_behavior_rules(own_session, vehicle_id, vehicle_name, ts)
+
+
+async def _evaluate_behavior_rules(session, vehicle_id: int,
+                                   vehicle_name: Optional[str],
+                                   ts: Optional[datetime]) -> None:
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    if vehicle_name is None:
+        vresult = await session.execute(
+            select(Vehicle.name).where(Vehicle.id == vehicle_id)
+        )
+        vehicle_name = vresult.scalar_one_or_none()
+        if vehicle_name is None:
+            return
+
+    rules = await _rule_cache.get(session)
+    day_start = datetime(ts.year, ts.month, ts.day, tzinfo=timezone.utc)
+    day_end = day_start + timedelta(days=1)
+
+    for rule in rules:
+        if rule.rule_type != RuleType.BEHAVIOR:
+            continue
+        if not _rule_applies_to_vehicle(rule, vehicle_id):
+            continue
+        if (not rule.sensor_type or rule.sensor_type not in BEHAVIOR_EVENT_TYPES
+                or rule.threshold_value is None):
+            continue
+
+        try:
+            et = DrivingEventType(rule.sensor_type)
+        except ValueError:
+            continue
+
+        count = (await session.execute(
+            select(func.count()).select_from(DrivingEvent).where(
+                DrivingEvent.vehicle_id == vehicle_id,
+                DrivingEvent.event_type == et,
+                DrivingEvent.ts >= day_start,
+                DrivingEvent.ts < day_end,
+            )
+        )).scalar() or 0
+
+        op = rule.operator or ">="
+        if not _condition_met(float(count), op, float(rule.threshold_value)):
+            continue
+        if await _has_open_alert(session, vehicle_id, rule.id):
+            continue
+
+        await _create_alert_and_work_order(
+            session,
+            vehicle_id=vehicle_id,
+            rule=rule,
+            title=rule.name,
+            message=(
+                f"{rule.description or rule.name}: {count} {rule.sensor_type} "
+                f"events today (threshold {op} {rule.threshold_value:.0f})"
+            ),
+            trigger_value=float(count),
+            ts=ts,
+            vehicle_name=vehicle_name,
+        )
 
 
 # ── DTC evaluation ────────────────────────────────────────────────────────────

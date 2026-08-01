@@ -33,7 +33,7 @@ async def _sweep_once() -> None:
         )
         stale_ids = [row[0] for row in result.all()]
         for vehicle_id in stale_ids:
-            new_health = await recompute_health(session, vehicle_id)
+            new_health = await recompute_health(session, vehicle_id, reason="offline_watchdog")
             if new_health:
                 await session.commit()
                 await publish_health_update(vehicle_id, new_health.value)

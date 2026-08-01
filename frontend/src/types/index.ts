@@ -8,7 +8,7 @@ export type AlertSeverity = 'critical' | 'warning' | 'info';
 export type AlertStatus = 'active' | 'acknowledged' | 'resolved' | 'suppressed';
 export type WorkOrderStatus = 'shadow' | 'open' | 'in_progress' | 'completed' | 'closed' | 'cancelled';
 export type WorkOrderPriority = 'urgent' | 'high' | 'medium' | 'low';
-export type RuleType = 'threshold' | 'dtc' | 'scheduled';
+export type RuleType = 'threshold' | 'dtc' | 'scheduled' | 'behavior' | 'anomaly';
 export type UserRole = 'admin' | 'fleet_manager' | 'technician';
 
 export interface Fleet {
@@ -300,7 +300,69 @@ export interface MaintenanceHistory {
   title: string;
   description?: string;
   performed_by?: string;
+  component?: string;
   event_date: string;
+}
+
+export interface BehaviorScorecard {
+  vehicle_id: number;
+  vehicle_name: string;
+  license_plate?: string;
+  score?: number | null;
+  date?: string | null;
+  trips: number;
+  distance_km: number;
+  idle_ratio: number;
+  events_per_100km: Record<string, number>;
+}
+
+export interface BehaviorScorePoint {
+  date: string;
+  score: number;
+  trips: number;
+  distance_km: number;
+  idle_ratio: number;
+  events_per_100km: Record<string, number>;
+}
+
+export interface BehaviorVehicleDetail {
+  vehicle_id: number;
+  vehicle_name: string;
+  scores: BehaviorScorePoint[];
+  event_breakdown: Record<string, number>;
+}
+
+export interface Trip {
+  id: number;
+  vehicle_id: number;
+  start_ts: string;
+  end_ts?: string;
+  start_odometer?: number;
+  end_odometer?: number;
+  distance_km?: number;
+  duration_seconds?: number;
+  max_speed?: number;
+  avg_speed?: number;
+  fuel_start?: number;
+  fuel_end?: number;
+  idle_seconds: number;
+  is_open: boolean;
+}
+
+export interface DrivingEvent {
+  id: number;
+  vehicle_id: number;
+  trip_id?: number;
+  ts: string;
+  event_type: string;
+  value?: number;
+  latitude?: number;
+  longitude?: number;
+  source: string;
+}
+
+export interface TripDetail extends Trip {
+  events: DrivingEvent[];
 }
 
 export interface WSMessage {
@@ -324,7 +386,7 @@ export interface SensorHistory {
 }
 
 export interface TimelineEvent {
-  kind: 'alert' | 'work_order' | 'maintenance';
+  kind: 'alert' | 'work_order' | 'maintenance' | 'health' | 'dtc' | 'driving';
   id: number;
   timestamp: string;
   title: string;

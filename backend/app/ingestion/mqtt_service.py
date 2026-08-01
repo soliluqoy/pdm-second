@@ -25,9 +25,11 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.db.database import async_session_factory
-from app.db.models import SensorReading, Vehicle, AssetHealth
+from app.db.models import DtcEvent, SensorReading, Vehicle, AssetHealth
 from app.db.redis_client import merge_vehicle_state, publish_telemetry, publish_health_update
-from app.rules.engine import evaluate_dtc, evaluate_telemetry
+from app.rules.engine import evaluate_behavior_rules, evaluate_dtc, evaluate_telemetry
+from app.services.behavior import process_telemetry, record_device_event
+from app.services.health import log_health_transition
 
 logger = logging.getLogger("predict.ingestion")
 
@@ -54,8 +56,10 @@ class MQTTIngestionService:
             logger.info("MQTT connected to %s:%s", settings.MQTT_HOST, settings.MQTT_PORT)
             client.subscribe(settings.MQTT_TELEMETRY_TOPIC, qos=1)
             client.subscribe(settings.MQTT_DTC_TOPIC, qos=1)
-            logger.info("Subscribed to: %s, %s",
-                        settings.MQTT_TELEMETRY_TOPIC, settings.MQTT_DTC_TOPIC)
+            client.subscribe(settings.MQTT_EVENT_TOPIC, qos=1)
+            logger.info("Subscribed to: %s, %s, %s",
+                        settings.MQTT_TELEMETRY_TOPIC, settings.MQTT_DTC_TOPIC,
+                        settings.MQTT_EVENT_TOPIC)
         else:
             logger.error("MQTT connection failed, reason_code=%s", reason_code)
 
@@ -112,12 +116,14 @@ class MQTTIngestionService:
             return
 
         imei = parts[1]
-        msg_type = parts[2]  # "telemetry" or "dtc"
+        msg_type = parts[2]  # "telemetry", "dtc", or "event"
 
         if msg_type == "telemetry":
             await self._handle_telemetry(imei, data)
         elif msg_type == "dtc":
             await self._handle_dtc(imei, data)
+        elif msg_type == "event":
+            await self._handle_event(imei, data)
 
     async def _handle_telemetry(self, imei: str, data: dict):
         """Process a telemetry message: store readings + update state + trigger rules."""
@@ -140,6 +146,7 @@ class MQTTIngestionService:
             # None (unknown) when the record doesn't carry the ignition flag —
             # defaulting to True would pollute idle/trip analytics.
             ignition = data.get("ignition")
+            movement = data.get("movement")
 
             # Build all readings for this record, insert in one batch
             readings = []
@@ -187,7 +194,25 @@ class MQTTIngestionService:
             # Update health to GREEN if was GREY (first / resumed data)
             was_grey = vehicle.health == AssetHealth.GREY
             if was_grey:
+                await log_health_transition(
+                    session, vehicle.id, AssetHealth.GREY, AssetHealth.GREEN,
+                    reason="telemetry_resume",
+                )
                 vehicle.health = AssetHealth.GREEN
+
+            # Trip SM + Tier-2 events (same session, before commit)
+            try:
+                await process_telemetry(
+                    session,
+                    vehicle_id=vehicle.id,
+                    ts=ts,
+                    sensors=sensors,
+                    ignition=ignition,
+                    movement=movement,
+                    gps=gps or None,
+                )
+            except Exception as e:
+                logger.error("Behavior processing error: %s", e)
 
             await session.commit()
 
@@ -200,6 +225,7 @@ class MQTTIngestionService:
                 "vehicle_id": vehicle.id,
                 "vehicle_name": vehicle.name,
                 "ignition": ignition,
+                "movement": movement,
                 "gps": gps or None,
                 "sensors": {r["sensor_type"]: {"value": r["value"], "unit": r["unit"]}
                             for r in readings_added},
@@ -224,12 +250,61 @@ class MQTTIngestionService:
                     )
                 except Exception as e:
                     logger.error("Rule engine error: %s", e)
+                try:
+                    await evaluate_behavior_rules(
+                        vehicle.id, session=session, vehicle_name=vehicle.name, ts=ts,
+                    )
+                except Exception as e:
+                    logger.error("Behavior rule engine error: %s", e)
             else:
                 logger.debug("Skipping rule evaluation: stale record "
                              "(age=%.0fs) vehicle=%s", record_age, vehicle.name)
 
             logger.debug("Ingested %d readings for vehicle %s (IMEI %s)",
                          len(readings_added), vehicle.name, imei)
+
+    async def _handle_event(self, imei: str, data: dict):
+        """Process a device-native eco-driving / overspeeding event."""
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Vehicle).where(Vehicle.imei == imei)
+            )
+            vehicle = result.scalar_one_or_none()
+            if not vehicle:
+                logger.warning("Event from unknown IMEI: %s", imei)
+                return
+
+            event_type = data.get("event_type")
+            if not event_type:
+                return
+            ts = self._parse_timestamp(data.get("timestamp"))
+            value = data.get("value")
+            try:
+                value_f = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value_f = None
+
+            try:
+                await record_device_event(
+                    session,
+                    vehicle_id=vehicle.id,
+                    ts=ts,
+                    event_type=str(event_type),
+                    value=value_f,
+                    latitude=data.get("latitude"),
+                    longitude=data.get("longitude"),
+                )
+                await session.commit()
+            except Exception as e:
+                logger.error("Device event ingest error: %s", e)
+                return
+
+            try:
+                await evaluate_behavior_rules(
+                    vehicle.id, session=session, vehicle_name=vehicle.name, ts=ts,
+                )
+            except Exception as e:
+                logger.error("Behavior rule engine error (device event): %s", e)
 
     async def _handle_dtc(self, imei: str, data: dict):
         """Process a DTC (Diagnostic Trouble Code) message."""
@@ -245,16 +320,28 @@ class MQTTIngestionService:
             dtc_code = data.get("dtc_code")
             description = data.get("description", "")
             severity = data.get("severity", "warning")
+            if not dtc_code:
+                return
 
             logger.info("DTC received: vehicle=%s IMEI=%s code=%s desc=%s",
                         vehicle.name, imei, dtc_code, description)
 
+            # Always persist the DTC event for the vehicle timeline.
+            ts = self._parse_timestamp(data.get("timestamp"))
+            session.add(DtcEvent(
+                vehicle_id=vehicle.id,
+                timestamp=ts,
+                dtc_code=str(dtc_code),
+                description=description or None,
+                severity=severity,
+            ))
+            await session.commit()
+
             # Freshness guard — same rationale as telemetry (buffered uploads
             # from the device must not fire alerts for old faults).
-            ts = self._parse_timestamp(data.get("timestamp"))
             record_age = (datetime.now(timezone.utc) - ts).total_seconds()
             if record_age > settings.RULE_MAX_RECORD_AGE_SECONDS:
-                logger.debug("Skipping stale DTC (age=%.0fs) vehicle=%s code=%s",
+                logger.debug("Skipping stale DTC rules (age=%.0fs) vehicle=%s code=%s",
                              record_age, vehicle.name, dtc_code)
                 return
 

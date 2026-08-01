@@ -15,10 +15,11 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.api import alerts, assets, dashboard, rules, system, workorders
+from app.api import alerts, assets, behavior, dashboard, rules, system, workorders
 from app.db.init_db import audit_dormant_rules, init_database, seed_database
 from app.db.database import engine, async_session_factory
 from app.ingestion.mqtt_service import mqtt_service
+from app.services.baselines import start_baselines_job, stop_baselines_job
 from app.services.settings_service import get_shadow_mode
 from app.services.watchdog import start_watchdog, stop_watchdog
 from app.ws.handler import start_ws_listener, stop_ws_listener, websocket_endpoint
@@ -59,6 +60,9 @@ async def lifespan(app: FastAPI):
     # 4. Start offline watchdog (GREEN → GREY when telemetry goes stale)
     start_watchdog()
 
+    # 5. Nightly baselines + anomaly detection (Phase 6)
+    start_baselines_job()
+
     logger.info("=== PREDICT ready ===  API: http://localhost:%d  Docs: /docs ===",
                 settings.BACKEND_PORT)
 
@@ -67,6 +71,7 @@ async def lifespan(app: FastAPI):
     # ── Shutdown ─────────────────────────────────────────────────────────────
     logger.info("=== PREDICT shutting down ===")
     mqtt_service.stop()
+    await stop_baselines_job()
     await stop_watchdog()
     await stop_ws_listener()
     await engine.dispose()
@@ -97,6 +102,7 @@ app.include_router(workorders.router, prefix="/api/v1")
 app.include_router(alerts.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
 app.include_router(rules.router, prefix="/api/v1")
+app.include_router(behavior.router, prefix="/api/v1")
 app.include_router(system.router, prefix="/api/v1")
 
 

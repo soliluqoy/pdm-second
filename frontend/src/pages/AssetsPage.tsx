@@ -1,11 +1,11 @@
 /**
  * PREDICT — Assets Page
  */
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import type {
-  Fleet,
   Vehicle,
   Component,
   Sensor,
@@ -16,6 +16,7 @@ import type {
 import Badge from '../components/ui/Badge';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { queryKeys } from '../queryClient';
 import { useWsSubscription } from '../ws/WsContext';
 import {
   HOST_PLACEHOLDER,
@@ -58,15 +59,21 @@ interface ThresholdDraft {
   critical: string;
 }
 
+function sortVehicles(list: Vehicle[]) {
+  return [...list].sort((a, b) => {
+    const healthDiff = healthOrder[a.health] - healthOrder[b.health];
+    if (healthDiff !== 0) return healthDiff;
+    return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
+  });
+}
+
 export default function AssetsPage() {
-  const [fleets, setFleets] = useState<Fleet[]>([]);
-  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const queryClient = useQueryClient();
   const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
   const [components, setComponents] = useState<Component[]>([]);
   const [selectedComponent, setSelectedComponent] = useState<Component | null>(null);
   const [sensors, setSensors] = useState<Sensor[]>([]);
   const [history, setHistory] = useState<MaintenanceHistory[]>([]);
-  const [loading, setLoading] = useState(true);
   const [showRegister, setShowRegister] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [registering, setRegistering] = useState(false);
@@ -76,39 +83,42 @@ export default function AssetsPage() {
   const [editingSensor, setEditingSensor] = useState<number | null>(null);
   const [thresholdDraft, setThresholdDraft] = useState<ThresholdDraft>({ warning: '', critical: '' });
   const [sensorError, setSensorError] = useState<string | null>(null);
-  const refreshTimer = useRef<number | null>(null);
+  const [activeFilter, setActiveFilter] = useState<'active' | 'retired' | 'all'>('active');
+  const [actionBusy, setActionBusy] = useState(false);
 
-  const sortVehicles = (list: Vehicle[]) =>
-    [...list].sort((a, b) => {
-      const healthDiff = healthOrder[a.health] - healthOrder[b.health];
-      if (healthDiff !== 0) return healthDiff;
-      return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
+  const vehicleFilter = useMemo(
+    () =>
+      activeFilter === 'all'
+        ? undefined
+        : { is_active: activeFilter === 'active' },
+    [activeFilter]
+  );
+
+  const fleetsQuery = useQuery({
+    queryKey: queryKeys.fleets,
+    queryFn: () => api.getFleets(),
+    refetchInterval: 30_000,
+  });
+
+  const vehiclesQuery = useQuery({
+    queryKey: queryKeys.vehicles(vehicleFilter),
+    queryFn: async () => sortVehicles(await api.getVehicles(vehicleFilter)),
+    refetchInterval: 15_000,
+  });
+
+  const fleets = fleetsQuery.data ?? [];
+  const vehicles = vehiclesQuery.data ?? [];
+  const loading = vehiclesQuery.isLoading;
+
+  useEffect(() => {
+    setSelectedVehicle((prev) => {
+      if (!prev) return prev;
+      return vehicles.find((x) => x.id === prev.id) ?? null;
     });
+  }, [vehicles]);
 
-  const fetchVehicles = useCallback(async () => {
-    try {
-      const v = await api.getVehicles();
-      setVehicles(sortVehicles(v));
-      setSelectedVehicle((prev) => {
-        if (!prev) return prev;
-        const updated = v.find((x) => x.id === prev.id);
-        return updated ? { ...prev, ...updated } : prev;
-      });
-    } catch (e) {
-      console.error('Failed to fetch vehicles:', e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const fetchFleets = useCallback(async () => {
-    try {
-      const f = await api.getFleets();
-      setFleets(f);
-    } catch (e) {
-      console.error('Failed to fetch fleets:', e);
-    }
-  }, []);
+  const invalidateVehicles = () =>
+    void queryClient.invalidateQueries({ queryKey: ['vehicles'] });
 
   const fetchHistory = useCallback(async (vehicleId: number) => {
     try {
@@ -120,37 +130,26 @@ export default function AssetsPage() {
     }
   }, []);
 
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(() => fetchVehicles(), 1500);
-  }, [fetchVehicles]);
-
-  useEffect(() => {
-    fetchFleets();
-    fetchVehicles();
-    const interval = setInterval(fetchVehicles, 15_000);
-    return () => clearInterval(interval);
-  }, [fetchFleets, fetchVehicles]);
-
   useWsSubscription(['ws:health', 'ws:alerts', 'ws:workorders'], (msg) => {
     if (msg.channel === 'ws:health') {
       const vehicleId = msg.data?.vehicle_id;
       const health = msg.data?.health;
       if (vehicleId && health) {
-        setVehicles((prev) =>
-          sortVehicles(
+        queryClient.setQueryData<Vehicle[]>(queryKeys.vehicles(vehicleFilter), (prev) => {
+          if (!prev) return prev;
+          return sortVehicles(
             prev.map((v) =>
               v.id === vehicleId ? { ...v, health: health as AssetHealth } : v
             )
-          )
-        );
+          );
+        });
         setSelectedVehicle((prev) => {
           if (!prev || prev.id !== vehicleId) return prev;
           return { ...prev, health: health as AssetHealth };
         });
       }
     } else {
-      scheduleRefresh();
+      invalidateVehicles();
       if (selectedVehicle && msg.channel === 'ws:workorders') {
         const vehicleId = msg.data?.vehicle_id;
         if (vehicleId === selectedVehicle.id) {
@@ -216,6 +215,69 @@ export default function AssetsPage() {
     }
   }, []);
 
+  const retireVehicle = async (v: Vehicle) => {
+    if (!window.confirm(`Retire "${v.name}"? It will leave the live dashboard but history is kept.`)) {
+      return;
+    }
+    setActionBusy(true);
+    try {
+      await api.updateVehicle(v.id, { is_active: false });
+      setSelectedVehicle(null);
+      setComponents([]);
+      setSensors([]);
+      setHistory([]);
+      invalidateVehicles();
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleets });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
+    } catch (e) {
+      console.error('Failed to retire vehicle:', e);
+      window.alert(e instanceof Error ? e.message : 'Failed to retire vehicle');
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const reactivateVehicle = async (v: Vehicle) => {
+    setActionBusy(true);
+    try {
+      await api.updateVehicle(v.id, { is_active: true });
+      invalidateVehicles();
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleets });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
+    } catch (e) {
+      console.error('Failed to reactivate vehicle:', e);
+      window.alert(e instanceof Error ? e.message : 'Failed to reactivate vehicle');
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const permanentlyDeleteVehicle = async (v: Vehicle) => {
+    if (
+      !window.confirm(
+        `Permanently delete "${v.name}"? This removes readings, alerts, and work orders. This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setActionBusy(true);
+    try {
+      await api.deleteVehicle(v.id);
+      setSelectedVehicle(null);
+      setComponents([]);
+      setSensors([]);
+      setHistory([]);
+      invalidateVehicles();
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleets });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
+    } catch (e) {
+      console.error('Failed to delete vehicle:', e);
+      window.alert(e instanceof Error ? e.message : 'Failed to delete vehicle');
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   const openRegister = () => {
     setForm(emptyForm);
     setRegisterError(null);
@@ -252,7 +314,9 @@ export default function AssetsPage() {
       });
       setShowRegister(false);
       setForm(emptyForm);
-      await fetchVehicles();
+      invalidateVehicles();
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleets });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
       await selectVehicle(created);
       setSmsVehicle(created);
       setCopyStatus(null);
@@ -360,10 +424,32 @@ export default function AssetsPage() {
               Register
             </button>
           </header>
+          <div className="px-4 py-2 border-b border-gray-100 flex flex-wrap gap-1">
+            {([
+              ['active', 'Active'],
+              ['retired', 'Retired'],
+              ['all', 'All'],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setActiveFilter(key)}
+                className={`px-2.5 py-1 text-xs rounded-md border ${
+                  activeFilter === key
+                    ? 'bg-predict-500 text-white border-predict-500'
+                    : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="max-h-[420px] overflow-y-auto">
             {vehicles.length === 0 ? (
               <p className="px-4 py-8 text-sm text-gray-500 text-center">
-                No vehicles yet. Register a Teltonika-equipped car to get started.
+                {activeFilter === 'retired'
+                  ? 'No retired vehicles.'
+                  : 'No vehicles yet. Register a Teltonika-equipped car to get started.'}
               </p>
             ) : (
               vehicles.map((v) => (
@@ -372,7 +458,7 @@ export default function AssetsPage() {
                   onClick={() => selectVehicle(v)}
                   className={`w-full text-left px-4 py-3 border-b border-gray-100 hover:bg-gray-50 ${
                     selectedVehicle?.id === v.id ? 'bg-predict-50 border-l-4 border-l-predict-500' : ''
-                  }`}
+                  } ${!v.is_active ? 'opacity-70' : ''}`}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div>
@@ -384,6 +470,7 @@ export default function AssetsPage() {
                       <p className="text-sm text-gray-500">{v.license_plate || 'No plate'}</p>
                     </div>
                     <div className="flex flex-col items-end gap-1">
+                      {!v.is_active && <Badge tone="neutral">retired</Badge>}
                       <Badge tone={healthTone[v.health] ?? 'neutral'}>{v.health}</Badge>
                       {!!v.active_alert_count && (
                         <span className="text-xs text-red-700">{v.active_alert_count} alert(s)</span>
@@ -541,6 +628,33 @@ export default function AssetsPage() {
                 }}
               >
                 SMS config helper
+              </button>
+              {selectedVehicle.is_active ? (
+                <button
+                  type="button"
+                  className="btn-secondary text-sm"
+                  disabled={actionBusy}
+                  onClick={() => retireVehicle(selectedVehicle)}
+                >
+                  Retire
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-secondary text-sm"
+                  disabled={actionBusy}
+                  onClick={() => reactivateVehicle(selectedVehicle)}
+                >
+                  Reactivate
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn-secondary text-sm text-red-700 border-red-200 hover:bg-red-50"
+                disabled={actionBusy}
+                onClick={() => permanentlyDeleteVehicle(selectedVehicle)}
+              >
+                Permanently delete
               </button>
             </div>
           </header>

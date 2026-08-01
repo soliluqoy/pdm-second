@@ -1,9 +1,11 @@
 /**
  * PREDICT — Rules Page
- * Full CRUD for detection rules (threshold / DTC / scheduled) plus the
- * shadow-mode toggle and work-order template list.
+ * Full CRUD for detection rules (threshold / DTC / scheduled / behavior)
+ * plus shadow-mode toggle and work-order template list. Anomaly rules are
+ * auto-generated (read-only badge).
  */
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import type {
@@ -11,13 +13,11 @@ import type {
   Rule,
   RuleInput,
   RuleType,
-  TelemetryCatalog,
-  Vehicle,
-  WorkOrderTemplate,
 } from '../types';
 import Badge from '../components/ui/Badge';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { queryKeys } from '../queryClient';
 
 const severityTone: Record<string, 'danger' | 'warning' | 'info'> = {
   critical: 'danger',
@@ -27,6 +27,14 @@ const severityTone: Record<string, 'danger' | 'warning' | 'info'> = {
 
 const OPERATORS = ['>', '>=', '<', '<=', '=='];
 const SCHEDULED_SENSORS = ['odometer', 'engine_hours'];
+const BEHAVIOR_EVENTS = [
+  'harsh_accel',
+  'harsh_brake',
+  'harsh_corner',
+  'speeding',
+  'idling',
+  'high_rpm',
+];
 
 interface RuleFormState {
   name: string;
@@ -79,40 +87,46 @@ function ruleToForm(r: Rule): RuleFormState {
 }
 
 export default function RulesPage() {
-  const [rules, setRules] = useState<Rule[]>([]);
-  const [templates, setTemplates] = useState<WorkOrderTemplate[]>([]);
-  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
-  const [catalog, setCatalog] = useState<TelemetryCatalog | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [shadowMode, setShadowMode] = useState(false);
+  const queryClient = useQueryClient();
   const [editing, setEditing] = useState<Rule | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<RuleFormState>(emptyForm);
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const fetchAll = useCallback(async () => {
-    try {
-      const [r, t, v] = await Promise.all([
-        api.getRules(),
-        api.getTemplates(),
-        api.getVehicles(),
-      ]);
-      setRules(r);
-      setTemplates(t);
-      setVehicles(v);
-    } catch (e) {
-      console.error('Failed to fetch rules:', e);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const rulesQuery = useQuery({
+    queryKey: queryKeys.rules,
+    queryFn: () => api.getRules(),
+  });
+  const templatesQuery = useQuery({
+    queryKey: queryKeys.templates,
+    queryFn: () => api.getTemplates(),
+  });
+  const vehiclesQuery = useQuery({
+    queryKey: queryKeys.vehicles({ is_active: true }),
+    queryFn: () => api.getVehicles({ is_active: true }),
+  });
+  const catalogQuery = useQuery({
+    queryKey: queryKeys.telemetryCatalog,
+    queryFn: () => api.getTelemetryCatalog(),
+    staleTime: Infinity,
+  });
+  const shadowQuery = useQuery({
+    queryKey: queryKeys.shadowMode,
+    queryFn: () => api.getShadowMode(),
+  });
 
-  useEffect(() => {
-    fetchAll();
-    api.getShadowMode().then((r) => setShadowMode(r.shadow_mode)).catch(console.error);
-    api.getTelemetryCatalog().then(setCatalog).catch(console.error);
-  }, [fetchAll]);
+  const rules = rulesQuery.data ?? [];
+  const templates = templatesQuery.data ?? [];
+  const vehicles = vehiclesQuery.data ?? [];
+  const catalog = catalogQuery.data ?? null;
+  const shadowMode = shadowQuery.data?.shadow_mode ?? false;
+  const loading = rulesQuery.isLoading || templatesQuery.isLoading;
+
+  const fetchAll = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.rules });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.templates });
+  };
 
   // Known sensor types from the telemetry catalog (both device models)
   const sensorTypeOptions = useMemo(() => {
@@ -124,7 +138,8 @@ export default function RulesPage() {
   const toggleShadowMode = async () => {
     try {
       const res = await api.setShadowMode(!shadowMode);
-      setShadowMode(res.shadow_mode);
+      queryClient.setQueryData(queryKeys.shadowMode, res);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboardSummary });
     } catch (e) {
       console.error('Failed to toggle shadow mode:', e);
     }
@@ -192,6 +207,19 @@ export default function RulesPage() {
     } else if (form.rule_type === 'dtc') {
       payload.dtc_code = form.dtc_code.trim().toUpperCase();
       if (!payload.dtc_code) return setFormError('DTC code is required (e.g. P0300).');
+    } else if (form.rule_type === 'behavior') {
+      payload.sensor_type = form.sensor_type;
+      payload.operator = form.operator || '>=';
+      payload.threshold_value = form.threshold_value === '' ? undefined : Number(form.threshold_value);
+      payload.duration_seconds = Number(form.duration_seconds) || 86400;
+      if (!BEHAVIOR_EVENTS.includes(payload.sensor_type ?? '')) {
+        return setFormError('Pick a driving event type (e.g. harsh_brake).');
+      }
+      if (payload.threshold_value == null || Number.isNaN(payload.threshold_value)) {
+        return setFormError('Event count threshold is required.');
+      }
+    } else if (form.rule_type === 'anomaly') {
+      return setFormError('Anomaly rules are auto-generated by the baselines job.');
     } else {
       payload.sensor_type = form.sensor_type;
       payload.interval_value = form.interval_value === '' ? undefined : Number(form.interval_value);
@@ -227,7 +255,7 @@ export default function RulesPage() {
     <div className="page-content">
       <PageHeader
         title="Rules"
-        description="Threshold, DTC, and scheduled rules that generate alerts and work orders"
+        description="Threshold, DTC, scheduled, and behavior rules that generate alerts and work orders"
         actions={
           <>
             <button onClick={openCreate} className="btn-primary flex items-center gap-1.5">
@@ -296,6 +324,14 @@ export default function RulesPage() {
                     {r.rule_type === 'dtc' && <>Code: {r.dtc_code}</>}
                     {r.rule_type === 'scheduled' && (
                       <>Every {r.interval_value} {r.sensor_type === 'engine_hours' ? 'h' : 'km'} ({r.sensor_type})</>
+                    )}
+                    {r.rule_type === 'behavior' && (
+                      <>
+                        {r.sensor_type} {r.operator ?? '>='} {r.threshold_value}/day
+                      </>
+                    )}
+                    {r.rule_type === 'anomaly' && (
+                      <>Auto · {r.sensor_type || 'generic'}</>
                     )}
                   </td>
                   <td className="text-gray-700">
@@ -396,6 +432,7 @@ export default function RulesPage() {
                     <option value="threshold">Threshold</option>
                     <option value="dtc">DTC (fault code)</option>
                     <option value="scheduled">Scheduled (interval)</option>
+                    <option value="behavior">Behavior (event count)</option>
                   </select>
                 </div>
                 <div>
@@ -497,6 +534,40 @@ export default function RulesPage() {
                       value={form.interval_value}
                       onChange={(e) => setForm((f) => ({ ...f, interval_value: e.target.value }))}
                       placeholder="10000"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {form.rule_type === 'behavior' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="filter-label">Event type *</label>
+                    <select
+                      className="filter-select w-full mt-1"
+                      value={form.sensor_type}
+                      onChange={(e) => setForm((f) => ({ ...f, sensor_type: e.target.value }))}
+                    >
+                      <option value="">Select…</option>
+                      {BEHAVIOR_EVENTS.map((e) => (
+                        <option key={e} value={e}>{e.replace(/_/g, ' ')}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="filter-label">Count / day *</label>
+                    <input
+                      type="number"
+                      min={1}
+                      className="filter-select w-full mt-1"
+                      value={form.threshold_value}
+                      onChange={(e) => setForm((f) => ({
+                        ...f,
+                        threshold_value: e.target.value,
+                        operator: '>=',
+                        duration_seconds: '86400',
+                      }))}
+                      placeholder="5"
                     />
                   </div>
                 </div>

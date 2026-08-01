@@ -8,6 +8,7 @@ the backend already consumes:
 
     teltonika/{imei}/telemetry  {timestamp, imei, ignition, gps{...}, sensors{...}}
     teltonika/{imei}/dtc        {timestamp, imei, dtc_code, description, severity}
+    teltonika/{imei}/event      {timestamp, imei, event_type, value, lat/lon, source}
 
 Multi-model support: the Teltonika handshake carries only the IMEI (no model).
 Normal ops: leave BRIDGE_DEVICES empty and the bridge polls the backend
@@ -102,6 +103,14 @@ _backend_registry: Dict[str, str] = {}
 
 TELEMETRY_TOPIC = "teltonika/{imei}/telemetry"
 DTC_TOPIC = "teltonika/{imei}/dtc"
+EVENT_TOPIC = "teltonika/{imei}/event"
+
+# Teltonika Green driving type (AVL 253) → PREDICT driving event_type
+_GREEN_DRIVING_TYPE = {
+    1: "harsh_accel",
+    2: "harsh_brake",
+    3: "harsh_corner",
+}
 
 
 def resolve_model(imei: str) -> str:
@@ -184,12 +193,12 @@ _unmapped_seen: set[tuple[str, int]] = set()
 
 
 def record_to_payload(imei: str, record: AvlRecord, io_map: Dict[int, dict],
-                      model: str = "?") -> Tuple[dict, list]:
-    """Convert one AvlRecord into (telemetry_payload, dtc_codes)."""
+                      model: str = "?") -> Tuple[dict, list, list]:
+    """Convert one AvlRecord into (telemetry_payload, dtc_codes, events)."""
     payload = {
         "timestamp": record.timestamp.isoformat(),
         "imei": imei,
-        "ignition": True,  # default unless AVL 239 (or mapped id) says otherwise
+        "ignition": None,  # unknown until AVL 239 (or mapped id) arrives
         "gps": {
             "latitude": record.latitude,
             "longitude": record.longitude,
@@ -201,6 +210,10 @@ def record_to_payload(imei: str, record: AvlRecord, io_map: Dict[int, dict],
         "sensors": {},
     }
     dtcs: list[str] = []
+    # Collect eco-driving IO elements, then emit one event when type+value pair.
+    green_type: Optional[int] = None
+    green_value: Optional[float] = None
+    overspeed_value: Optional[float] = None
 
     for avl_id, raw in record.io.items():
         entry = io_map.get(avl_id)
@@ -239,6 +252,8 @@ def record_to_payload(imei: str, record: AvlRecord, io_map: Dict[int, dict],
         elif kind == "meta":
             if sensor_type == "ignition":
                 payload["ignition"] = bool(int(value)) if not isinstance(value, str) else bool(value)
+            elif sensor_type == "movement":
+                payload["movement"] = bool(int(value)) if not isinstance(value, str) else bool(value)
             else:
                 payload[sensor_type] = value
         elif kind == "dtc":
@@ -249,8 +264,45 @@ def record_to_payload(imei: str, record: AvlRecord, io_map: Dict[int, dict],
                 code = code.strip()
                 if code:
                     dtcs.append(code)
+        elif kind == "event":
+            if sensor_type == "green_driving_type":
+                try:
+                    green_type = int(value)
+                except (TypeError, ValueError):
+                    pass
+            elif sensor_type == "green_driving_value":
+                try:
+                    green_value = float(value)
+                except (TypeError, ValueError):
+                    pass
+            elif sensor_type == "overspeeding":
+                try:
+                    overspeed_value = float(value)
+                except (TypeError, ValueError):
+                    pass
 
-    return payload, dtcs
+    events: list[dict] = []
+    base_event = {
+        "timestamp": payload["timestamp"],
+        "imei": imei,
+        "latitude": record.latitude,
+        "longitude": record.longitude,
+        "source": "device",
+    }
+    if green_type is not None and green_type in _GREEN_DRIVING_TYPE:
+        events.append({
+            **base_event,
+            "event_type": _GREEN_DRIVING_TYPE[green_type],
+            "value": green_value if green_value is not None else float(green_type),
+        })
+    if overspeed_value is not None and overspeed_value > 0:
+        events.append({
+            **base_event,
+            "event_type": "speeding",
+            "value": overspeed_value,
+        })
+
+    return payload, dtcs, events
 
 
 # ── MQTT client (paho runs its network loop in a background thread; publish()
@@ -360,7 +412,7 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 buf = buf[consumed:]
 
                 for record in records:
-                    payload, dtcs = record_to_payload(imei, record, io_map, model)
+                    payload, dtcs, events = record_to_payload(imei, record, io_map, model)
                     publish(TELEMETRY_TOPIC.format(imei=imei), payload)
                     for code in dtcs:
                         publish(DTC_TOPIC.format(imei=imei), {
@@ -370,6 +422,8 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             "description": "",
                             "severity": "warning",
                         })
+                    for ev in events:
+                        publish(EVENT_TOPIC.format(imei=imei), ev)
 
                 writer.write(build_ack(len(records)))
                 await writer.drain()

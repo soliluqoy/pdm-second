@@ -3,7 +3,7 @@
     "Maps Teltonika FMC001 (OBD-II plug-in) AVL I/O element IDs → PREDICT sensor types.",
     "Per-model file: the bridge picks avl_map.<model>.json by the IMEI→model mapping in BRIDGE_DEVICES (see fmc_bridge.py). Sibling file: avl_map.fmc150.json.",
     "The bridge publishes value = raw * scale + offset.",
-    "kind 'sensor' → payload.sensors[sensor_type]; kind 'meta' → top-level payload field (e.g. ignition, vin); kind 'dtc' → published to teltonika/{imei}/dtc.",
+    "kind 'sensor' → payload.sensors[sensor_type]; kind 'meta' → top-level payload field (e.g. ignition, vin); kind 'dtc' → published to teltonika/{imei}/dtc; kind 'event' → published to teltonika/{imei}/event (eco-driving).",
     "encoding 'ascii' → variable-length (8E X-group) bytes are decoded as ASCII instead of hex (needed for AVL 256 VIN and AVL 281 fault codes).",
     "AVL IDs follow the Teltonika wiki page 'FMC001 Teltonika Data Sending Parameters ID' — IDs 30-60 are the standard OBD-II PID group, 256/281/402 require Data Protocol = Codec 8 Extended on the device.",
     "sensor_type strings MUST stay in sync with backend/app/services/provisioning.py (FMC001_SENSOR_CATALOG) and backend/app/db/init_db.py (SEED_RULES).",
@@ -36,6 +36,10 @@
     { "id": 58,  "sensor_type": "engine_oil_temperature", "name": "Engine Oil Temperature", "unit": "°C", "kind": "sensor", "scale": 1, "offset": 0 },
     { "id": 60,  "sensor_type": "fuel_rate",     "name": "Fuel Rate",               "unit": "L/h", "kind": "sensor", "scale": 0.01, "offset": 0 },
     { "id": 281, "sensor_type": "dtc",           "name": "Fault Codes",             "unit": "",   "kind": "dtc",    "encoding": "ascii", "_comment": "Comma-separated ASCII codes via 8E X-group — bridge splits and publishes each to teltonika/{imei}/dtc" },
-    { "id": 402, "sensor_type": "distance_until_service", "name": "Distance Until Service", "unit": "km", "kind": "sensor", "scale": 1, "offset": 0, "_comment": "OEM PID (FMC001 supported) — countdown to next scheduled service; not every car answers it" }
+    { "id": 402, "sensor_type": "distance_until_service", "name": "Distance Until Service", "unit": "km", "kind": "sensor", "scale": 1, "offset": 0, "_comment": "OEM PID (FMC001 supported) — countdown to next scheduled service; not every car answers it" },
+
+    { "id": 253, "sensor_type": "green_driving_type",  "name": "Green Driving Type",  "unit": "",  "kind": "event", "scale": 1, "offset": 0, "_comment": "1=harsh accel, 2=harsh brake, 3=harsh corner — enable Eco driving in Configurator" },
+    { "id": 254, "sensor_type": "green_driving_value", "name": "Green Driving Value", "unit": "",  "kind": "event", "scale": 1, "offset": 0, "_comment": "Magnitude paired with AVL 253" },
+    { "id": 255, "sensor_type": "overspeeding",        "name": "Overspeeding",        "unit": "km/h", "kind": "event", "scale": 1, "offset": 0, "_comment": "Device overspeeding event — enable Overspeeding in Configurator" }
   ]
 }

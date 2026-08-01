@@ -13,6 +13,8 @@ import SensorTile from './SensorTile';
 interface Props {
   vehicle: VehicleLiveItem;
   onSelectSensor: (vehicleId: number, sensor: LiveSensorItem) => void;
+  /** Denser sensor grid for multi-column dashboard layout. */
+  compact?: boolean;
 }
 
 const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
@@ -22,7 +24,7 @@ const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> =
   grey: 'neutral',
 };
 
-function VehicleTelemetryCardInner({ vehicle, onSelectSensor }: Props) {
+function VehicleTelemetryCardInner({ vehicle, onSelectSensor, compact = false }: Props) {
   const ts = vehicle.telemetry_timestamp ?? vehicle.last_seen;
 
   // Local 15s clock for the stale indicator — doesn't tick the page.
@@ -82,7 +84,13 @@ function VehicleTelemetryCardInner({ vehicle, onSelectSensor }: Props) {
         </div>
       </div>
 
-      <div className="p-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+      <div
+        className={
+          compact
+            ? 'p-3 grid grid-cols-2 sm:grid-cols-3 gap-2'
+            : 'p-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3'
+        }
+      >
         {vehicle.sensors.length === 0 ? (
           <p className="col-span-full text-sm text-gray-500 py-4 text-center">
             No sensors configured.

@@ -4,6 +4,8 @@
  */
 import type {
   Alert,
+  BehaviorScorecard,
+  BehaviorVehicleDetail,
   Component,
   DashboardSummary,
   Fleet,
@@ -15,6 +17,8 @@ import type {
   SensorReading,
   TelemetryCatalog,
   TimelineEvent,
+  Trip,
+  TripDetail,
   User,
   Vehicle,
   VehicleLiveItem,
@@ -105,19 +109,53 @@ class ApiClient {
   }
 
   /** Bucketed sensor history (Timescale continuous aggregates for long ranges). */
-  getSensorHistory(vehicleId: number, sensorType: string, hours: number, resolution = 'auto') {
+  getSensorHistory(
+    vehicleId: number,
+    sensorType: string,
+    hours: number,
+    resolution = 'auto',
+    range?: { from?: string; to?: string },
+  ) {
     const params = new URLSearchParams({
       sensor_type: sensorType,
       hours: String(hours),
       resolution,
     });
+    if (range?.from && range?.to) {
+      params.set('from', range.from);
+      params.set('to', range.to);
+    }
     return this.request<SensorHistory>(`/dashboard/vehicles/${vehicleId}/history?${params}`);
   }
 
-  /** Merged event stream: alerts + work orders + maintenance. */
-  getVehicleTimeline(vehicleId: number, limit = 100) {
+  /** CSV download URL for sensor history (same filters as getSensorHistory). */
+  sensorHistoryCsvUrl(
+    vehicleId: number,
+    sensorType: string,
+    hours: number,
+    resolution = 'auto',
+    range?: { from?: string; to?: string },
+  ) {
+    const params = new URLSearchParams({
+      sensor_type: sensorType,
+      hours: String(hours),
+      resolution,
+    });
+    if (range?.from && range?.to) {
+      params.set('from', range.from);
+      params.set('to', range.to);
+    }
+    return `${this.baseUrl}/dashboard/vehicles/${vehicleId}/history/csv?${params}`;
+  }
+
+  /** Merged event stream: alerts, work orders, maintenance, health, DTCs. */
+  getVehicleTimeline(vehicleId: number, limit = 100, skip = 0) {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      skip: String(skip),
+    });
     return this.request<TimelineEvent[]>(
-      `/dashboard/vehicles/${vehicleId}/timeline?limit=${limit}`
+      `/dashboard/vehicles/${vehicleId}/timeline?${params}`
     );
   }
 
@@ -126,10 +164,11 @@ class ApiClient {
     return this.request<Fleet[]>('/assets/fleets');
   }
 
-  getVehicles(params?: { fleet_id?: number; health?: string }) {
+  getVehicles(params?: { fleet_id?: number; health?: string; is_active?: boolean }) {
     const query = new URLSearchParams();
     if (params?.fleet_id) query.set('fleet_id', String(params.fleet_id));
     if (params?.health) query.set('health', params.health);
+    if (params?.is_active !== undefined) query.set('is_active', String(params.is_active));
     const q = query.toString();
     return this.request<Vehicle[]>(`/assets/vehicles${q ? '?' + q : ''}`);
   }
@@ -183,12 +222,21 @@ class ApiClient {
   }
 
   // ── Work Orders ──────────────────────────────────────────────────────────────
-  getWorkOrders(params?: { status?: string; priority?: string; is_shadow?: boolean; vehicle_id?: number }) {
+  getWorkOrders(params?: {
+    status?: string;
+    priority?: string;
+    is_shadow?: boolean;
+    vehicle_id?: number;
+    skip?: number;
+    limit?: number;
+  }) {
     const query = new URLSearchParams();
     if (params?.status) query.set('status', params.status);
     if (params?.priority) query.set('priority', params.priority);
     if (params?.is_shadow !== undefined) query.set('is_shadow', String(params.is_shadow));
     if (params?.vehicle_id !== undefined) query.set('vehicle_id', String(params.vehicle_id));
+    if (params?.skip) query.set('skip', String(params.skip));
+    if (params?.limit) query.set('limit', String(params.limit));
     const q = query.toString();
     return this.request<WorkOrder[]>(`/workorders${q ? '?' + q : ''}`);
   }
@@ -200,10 +248,14 @@ class ApiClient {
     });
   }
 
-  completeWorkOrder(id: number, completedBy: string, notes?: string) {
+  completeWorkOrder(id: number, completedBy: string, notes?: string, component?: string) {
     return this.request<WorkOrder>(`/workorders/${id}/complete`, {
       method: 'POST',
-      body: JSON.stringify({ completed_by: completedBy, completion_notes: notes }),
+      body: JSON.stringify({
+        completed_by: completedBy,
+        completion_notes: notes,
+        component: component || undefined,
+      }),
     });
   }
 
@@ -298,6 +350,29 @@ class ApiClient {
 
   getVehicleHistory(vehicleId: number) {
     return this.request<MaintenanceHistory[]>(`/system/history/vehicle/${vehicleId}`);
+  }
+
+  // ── Behavior ───────────────────────────────────────────────────────────────
+  getBehaviorSummary(days = 1) {
+    return this.request<BehaviorScorecard[]>(`/behavior/summary?days=${days}`);
+  }
+
+  getVehicleBehavior(vehicleId: number, days = 14) {
+    return this.request<BehaviorVehicleDetail>(
+      `/behavior/vehicles/${vehicleId}?days=${days}`
+    );
+  }
+
+  getVehicleTrips(vehicleId: number, limit = 50, skip = 0) {
+    return this.request<Trip[]>(
+      `/behavior/vehicles/${vehicleId}/trips?limit=${limit}&skip=${skip}`
+    );
+  }
+
+  getTripDetail(vehicleId: number, tripId: number) {
+    return this.request<TripDetail>(
+      `/behavior/vehicles/${vehicleId}/trips/${tripId}`
+    );
   }
 }
 

@@ -1,10 +1,11 @@
 /**
  * PREDICT — Dashboard Page
  * Fleet summary + live sensor telemetry grid.
- * Data flow: initial REST load + WebSocket patches; 30s REST reconciliation.
+ * Data flow: React Query REST + WebSocket patches; 30s reconciliation.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { LayoutGrid, Rows3, Search } from 'lucide-react';
 import { api } from '../api/client';
 import SensorDetailDrawer from '../components/dashboard/SensorDetailDrawer';
 import TelemetryCatalogPanel from '../components/dashboard/TelemetryCatalogPanel';
@@ -14,12 +15,8 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import EmptyState from '../components/ui/EmptyState';
 import { useWsSubscription } from '../ws/WsContext';
-import type {
-  DashboardSummary,
-  LiveSensorItem,
-  TelemetryCatalog,
-  VehicleLiveItem,
-} from '../types';
+import { queryKeys } from '../queryClient';
+import type { LiveSensorItem, VehicleLiveItem } from '../types';
 import { computeSensorStatus } from '../utils/sensors';
 
 interface SelectedSensor {
@@ -35,6 +32,7 @@ const healthOrder: Record<string, number> = {
 };
 
 const healthFilters = ['all', 'red', 'yellow', 'green', 'grey'] as const;
+const LAYOUT_KEY = 'predict.dashboard.layout';
 
 function sortFleet(list: VehicleLiveItem[]): VehicleLiveItem[] {
   return [...list].sort((a, b) => {
@@ -42,6 +40,15 @@ function sortFleet(list: VehicleLiveItem[]): VehicleLiveItem[] {
     if (healthDiff !== 0) return healthDiff;
     return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
   });
+}
+
+function readLayout(): 'stack' | 'compact' {
+  try {
+    const v = localStorage.getItem(LAYOUT_KEY);
+    return v === 'compact' ? 'compact' : 'stack';
+  } catch {
+    return 'stack';
+  }
 }
 
 /** "N of M live" badge with its own clock so the page doesn't tick. */
@@ -62,77 +69,77 @@ function LiveCountBadge({ fleet }: { fleet: VehicleLiveItem[] }) {
 }
 
 export default function DashboardPage() {
-  const [summary, setSummary] = useState<DashboardSummary | null>(null);
-  const [fleet, setFleet] = useState<VehicleLiveItem[]>([]);
-  const [telemetryCatalog, setTelemetryCatalog] = useState<TelemetryCatalog | null>(null);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
   const [selected, setSelected] = useState<SelectedSensor | null>(null);
   const [search, setSearch] = useState('');
   const [healthFilter, setHealthFilter] = useState<string>('all');
-  const refreshTimer = useRef<number | null>(null);
+  const [layout, setLayout] = useState<'stack' | 'compact'>(readLayout);
 
-  const fetchData = useCallback(async (showSpinner = false) => {
-    if (showSpinner) setLoading(true);
+  const summaryQuery = useQuery({
+    queryKey: queryKeys.dashboardSummary,
+    queryFn: () => api.getDashboardSummary(),
+    refetchInterval: 30_000,
+  });
+
+  const fleetQuery = useQuery({
+    queryKey: queryKeys.fleetLive,
+    queryFn: async () => sortFleet(await api.getFleetLive()),
+    refetchInterval: 30_000,
+  });
+
+  const catalogQuery = useQuery({
+    queryKey: queryKeys.telemetryCatalog,
+    queryFn: () => api.getTelemetryCatalog(),
+    staleTime: Infinity,
+  });
+
+  const summary = summaryQuery.data ?? null;
+  const fleet = fleetQuery.data ?? [];
+  const telemetryCatalog = catalogQuery.data ?? null;
+  const loading = summaryQuery.isLoading || fleetQuery.isLoading;
+
+  const setLayoutPref = (next: 'stack' | 'compact') => {
+    setLayout(next);
     try {
-      const [s, f] = await Promise.all([
-        api.getDashboardSummary(),
-        api.getFleetLive(),
-      ]);
-      setSummary(s);
-      setFleet(sortFleet(f));
-    } catch (e) {
-      console.error('Failed to fetch dashboard data:', e);
-    } finally {
-      setLoading(false);
+      localStorage.setItem(LAYOUT_KEY, next);
+    } catch {
+      /* ignore */
     }
-  }, []);
+  };
 
-  useEffect(() => {
-    fetchData(true);
-    // Reconciliation poll: WS is the primary update path.
-    const interval = setInterval(() => fetchData(), 30_000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
-
-  // The telemetry catalog is static — fetch it once.
-  useEffect(() => {
-    api.getTelemetryCatalog().then(setTelemetryCatalog).catch(console.error);
-  }, []);
-
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(() => fetchData(), 1500);
-  }, [fetchData]);
-
-  const patchTelemetry = useCallback((payload: any) => {
-    const vehicleId = payload?.vehicle_id;
-    const data = payload?.data;
-    if (!vehicleId || !data) return;
-    setFleet((prev) =>
-      prev.map((v) => {
-        if (v.id !== vehicleId) return v;
-        const live = data.sensors ?? {};
-        const sensors = v.sensors.map((s) => {
-          const r = live[s.sensor_type];
-          if (!r || r.value === undefined || r.value === null) return s;
+  const patchTelemetry = useCallback(
+    (payload: any) => {
+      const vehicleId = payload?.vehicle_id;
+      const data = payload?.data;
+      if (!vehicleId || !data) return;
+      queryClient.setQueryData<VehicleLiveItem[]>(queryKeys.fleetLive, (prev) => {
+        if (!prev) return prev;
+        return prev.map((v) => {
+          if (v.id !== vehicleId) return v;
+          const live = data.sensors ?? {};
+          const sensors = v.sensors.map((s) => {
+            const r = live[s.sensor_type];
+            if (!r || r.value === undefined || r.value === null) return s;
+            return {
+              ...s,
+              value: r.value,
+              unit: r.unit ?? s.unit,
+              status: computeSensorStatus(r.value, s),
+            };
+          });
           return {
-            ...s,
-            value: r.value,
-            unit: r.unit ?? s.unit,
-            status: computeSensorStatus(r.value, s),
+            ...v,
+            sensors,
+            ignition: data.ignition ?? v.ignition,
+            speed: data.gps?.speed ?? v.speed,
+            telemetry_timestamp: data.timestamp ?? v.telemetry_timestamp,
+            last_seen: data.timestamp ?? v.last_seen,
           };
         });
-        return {
-          ...v,
-          sensors,
-          ignition: data.ignition ?? v.ignition,
-          speed: data.gps?.speed ?? v.speed,
-          telemetry_timestamp: data.timestamp ?? v.telemetry_timestamp,
-          last_seen: data.timestamp ?? v.last_seen,
-        };
-      })
-    );
-  }, []);
+      });
+    },
+    [queryClient]
+  );
 
   useWsSubscription(
     ['ws:telemetry', 'ws:health', 'ws:alerts', 'ws:workorders'],
@@ -143,13 +150,16 @@ export default function DashboardPage() {
         const vehicleId = msg.data?.vehicle_id;
         const health = msg.data?.health;
         if (vehicleId && health) {
-          setFleet((prev) =>
-            sortFleet(prev.map((v) => (v.id === vehicleId ? { ...v, health } : v)))
-          );
+          queryClient.setQueryData<VehicleLiveItem[]>(queryKeys.fleetLive, (prev) => {
+            if (!prev) return prev;
+            return sortFleet(prev.map((v) => (v.id === vehicleId ? { ...v, health } : v)));
+          });
         }
-        scheduleRefresh();
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dashboardSummary });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
       } else {
-        scheduleRefresh();
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dashboardSummary });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.fleetLive });
       }
     }
   );
@@ -239,33 +249,57 @@ export default function DashboardPage() {
           <h2 className="section-title mb-0">Live telemetry</h2>
           <p className="text-sm text-gray-600">Click a sensor for history and thresholds.</p>
         </div>
-        {fleet.length > 1 && (
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative">
-              <Search className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Name, plate, IMEI…"
-                className="filter-select pl-8 w-48"
-              />
-            </div>
-            {healthFilters.map((h) => (
-              <button
-                key={h}
-                type="button"
-                onClick={() => setHealthFilter(h)}
-                className={`px-2.5 py-1.5 rounded-md text-xs font-medium capitalize border ${
-                  healthFilter === h
-                    ? 'bg-predict-50 border-predict-300 text-predict-700'
-                    : 'bg-white border-gray-200 text-gray-600 hover:text-gray-900'
-                }`}
-              >
-                {h}
-              </button>
-            ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex rounded-md border border-gray-200 overflow-hidden">
+            <button
+              type="button"
+              title="Stack layout"
+              onClick={() => setLayoutPref('stack')}
+              className={`px-2 py-1.5 ${
+                layout === 'stack' ? 'bg-predict-50 text-predict-700' : 'bg-white text-gray-500'
+              }`}
+            >
+              <Rows3 className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              title="Compact grid"
+              onClick={() => setLayoutPref('compact')}
+              className={`px-2 py-1.5 border-l border-gray-200 ${
+                layout === 'compact' ? 'bg-predict-50 text-predict-700' : 'bg-white text-gray-500'
+              }`}
+            >
+              <LayoutGrid className="w-4 h-4" />
+            </button>
           </div>
-        )}
+          {fleet.length > 1 && (
+            <>
+              <div className="relative">
+                <Search className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Name, plate, IMEI…"
+                  className="filter-select pl-8 w-48"
+                />
+              </div>
+              {healthFilters.map((h) => (
+                <button
+                  key={h}
+                  type="button"
+                  onClick={() => setHealthFilter(h)}
+                  className={`px-2.5 py-1.5 rounded-md text-xs font-medium capitalize border ${
+                    healthFilter === h
+                      ? 'bg-predict-50 border-predict-300 text-predict-700'
+                      : 'bg-white border-gray-200 text-gray-600 hover:text-gray-900'
+                  }`}
+                >
+                  {h}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
       </div>
 
       {fleet.length === 0 ? (
@@ -281,12 +315,17 @@ export default function DashboardPage() {
       ) : visibleFleet.length === 0 ? (
         <EmptyState message="No vehicles match your filter." />
       ) : (
-        <div className="space-y-4">
+        <div
+          className={
+            layout === 'compact' ? 'grid grid-cols-1 md:grid-cols-2 gap-4' : 'space-y-4'
+          }
+        >
           {visibleFleet.map((v) => (
             <VehicleTelemetryCard
               key={v.id}
               vehicle={v}
               onSelectSensor={handleSelectSensor}
+              compact={layout === 'compact'}
             />
           ))}
         </div>

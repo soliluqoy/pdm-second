@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     MQTT_PASSWORD: str = "predict_sim_pass"
     MQTT_TELEMETRY_TOPIC: str = "teltonika/+/telemetry"
     MQTT_DTC_TOPIC: str = "teltonika/+/dtc"
+    MQTT_EVENT_TOPIC: str = "teltonika/+/event"
 
     # ── Backend ───────────────────────────────────────────────────────────────
     BACKEND_HOST: str = "0.0.0.0"
