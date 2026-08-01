@@ -151,7 +151,28 @@ async def get_fleet_health(db: AsyncSession = Depends(get_db)):
     return items
 
 
-# ── Live fleet telemetry helpers ──────────────────────────────────────────────
+def _parse_state_timestamp(ts_raw) -> Optional[datetime]:
+    """Parse ISO timestamp from a Redis vehicle state snapshot."""
+    if not ts_raw:
+        return None
+    if isinstance(ts_raw, datetime):
+        return ts_raw if ts_raw.tzinfo else ts_raw.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_state_live(state: dict) -> bool:
+    """True when Redis snapshot is fresh enough to show as live telemetry."""
+    ts = _parse_state_timestamp(state.get("timestamp"))
+    if ts is None:
+        return False
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age <= settings.TELEMETRY_LIVE_MAX_AGE_SECONDS
+
+
 def _infer_direction(sensor: Sensor, rules: List[Rule]) -> str:
     """Infer whether high or low values are bad for a sensor.
 
@@ -252,13 +273,14 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
     items: List[VehicleLiveItem] = []
     for v in vehicles:
         state = states.get(v.id) or {}
-        live = state.get("sensors") or {}
-        gps = state.get("gps") or {}
+        is_live = _is_state_live(state)
+        live = state.get("sensors") or {} if is_live else {}
+        gps = state.get("gps") or {} if is_live else {}
 
         sensor_items: List[LiveSensorItem] = []
         for s in sensors_by_vehicle.get(v.id, []):
             reading = live.get(s.sensor_type) or {}
-            value = reading.get("value")
+            value = reading.get("value") if is_live else None
             sensor_rules = rules_by_type.get(s.sensor_type, [])
             direction = _infer_direction(s, sensor_rules)
             sensor_items.append(LiveSensorItem(
@@ -283,9 +305,9 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
         items.append(VehicleLiveItem(
             id=v.id, name=v.name, imei=v.imei, license_plate=v.license_plate,
             health=v.health, last_seen=v.last_seen,
-            ignition=state.get("ignition"),
-            speed=gps.get("speed"),
-            telemetry_timestamp=state.get("timestamp"),
+            ignition=state.get("ignition") if is_live else None,
+            speed=gps.get("speed") if is_live else None,
+            telemetry_timestamp=state.get("timestamp") if is_live else None,
             active_alert_count=alert_counts.get(v.id, 0),
             open_work_order_count=wo_counts.get(v.id, 0),
             sensors=sensor_items,
@@ -324,6 +346,8 @@ async def get_vehicle_latest(vehicle_id: int, db: AsyncSession = Depends(get_db)
     """Latest cached state for a vehicle (from Redis)."""
     from app.db.redis_client import get_vehicle_state
     state = await get_vehicle_state(vehicle_id)
+    if state and not _is_state_live(state):
+        state = None
     if not state:
         # Fallback: query latest reading per sensor type
         since = datetime.now(timezone.utc) - timedelta(minutes=30)

@@ -1,6 +1,13 @@
 # PREDICT — Project Status & Backlog
 
+> **⚠️ SUPERSEDED (2026-08-01):** The simulator and demo seed data have been
+> **removed**. The stack now runs on real FMC150 hardware via the `bridge/`
+> service (Teltonika Codec 8/8E → MQTT). See `README.md` and `FMC150-SETUP.md`
+> for the current architecture. This file is kept for historical reference;
+> the contract invariants below (topics, payload shape, WS channels) still hold.
+>
 > **Purpose:** Living reference for architecture, verification, and remaining polish.  
+
 > The original sprint plan is **largely complete** — the full loop (simulator → MQTT → ingestion → rule engine → alerts/work orders → WebSocket → dashboard) is working in the running stack.
 
 **Last audited:** 2026-07-31  

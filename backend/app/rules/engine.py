@@ -15,7 +15,6 @@ from app.db.models import (
     Alert,
     AlertSeverity,
     AlertStatus,
-    AssetHealth,
     Rule,
     RuleType,
     SystemConfig,
@@ -30,6 +29,7 @@ from app.db.redis_client import (
     publish_work_order,
     redis_client,
 )
+from app.services.health import recompute_health
 
 logger = logging.getLogger("predict.rules")
 
@@ -109,37 +109,6 @@ async def _has_open_alert(session, vehicle_id: int, rule_id: int) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def _recompute_health(session, vehicle_id: int) -> Optional[AssetHealth]:
-    """Recompute vehicle health from active alerts. Returns new health if changed."""
-    result = await session.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
-    vehicle = result.scalar_one_or_none()
-    if not vehicle:
-        return None
-
-    alerts_result = await session.execute(
-        select(Alert.severity).where(
-            Alert.vehicle_id == vehicle_id,
-            Alert.status == AlertStatus.ACTIVE,
-        )
-    )
-    severities = [row[0] for row in alerts_result.all()]
-
-    if any(s == AlertSeverity.CRITICAL for s in severities):
-        new_health = AssetHealth.RED
-    elif any(s == AlertSeverity.WARNING for s in severities):
-        new_health = AssetHealth.YELLOW
-    elif vehicle.last_seen:
-        new_health = AssetHealth.GREEN
-    else:
-        new_health = AssetHealth.GREY
-
-    old_health = vehicle.health
-    if old_health != new_health:
-        vehicle.health = new_health
-        return new_health
-    return None
-
-
 async def _create_alert_and_work_order(
     session,
     *,
@@ -189,7 +158,7 @@ async def _create_alert_and_work_order(
             await session.flush()
             alert.work_order_id = wo.id
 
-    new_health = await _recompute_health(session, vehicle_id)
+    new_health = await recompute_health(session, vehicle_id)
     await session.commit()
 
     alert_payload = {

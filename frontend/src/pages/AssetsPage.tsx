@@ -1,9 +1,9 @@
 /**
  * PREDICT — Assets Page
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { Fleet, Vehicle, Component, Sensor } from '../types';
+import type { Fleet, Vehicle, Component, Sensor, MaintenanceHistory, AssetHealth, WSMessage } from '../types';
 import Badge from '../components/ui/Badge';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
@@ -15,19 +15,41 @@ const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> =
   grey: 'neutral',
 };
 
-export default function AssetsPage() {
+const healthOrder: Record<AssetHealth, number> = {
+  red: 0,
+  yellow: 1,
+  green: 2,
+  grey: 3,
+};
+
+export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) {
   const [fleets, setFleets] = useState<Fleet[]>([]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
   const [components, setComponents] = useState<Component[]>([]);
   const [selectedComponent, setSelectedComponent] = useState<Component | null>(null);
   const [sensors, setSensors] = useState<Sensor[]>([]);
+  const [history, setHistory] = useState<MaintenanceHistory[]>([]);
   const [loading, setLoading] = useState(true);
+  const lastWsIdx = useRef(0);
+  const refreshTimer = useRef<number | null>(null);
+
+  const sortVehicles = (list: Vehicle[]) =>
+    [...list].sort((a, b) => {
+      const healthDiff = healthOrder[a.health] - healthOrder[b.health];
+      if (healthDiff !== 0) return healthDiff;
+      return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
+    });
 
   const fetchVehicles = useCallback(async () => {
     try {
       const v = await api.getVehicles();
-      setVehicles(v);
+      setVehicles(sortVehicles(v));
+      setSelectedVehicle((prev) => {
+        if (!prev) return prev;
+        const updated = v.find((x) => x.id === prev.id);
+        return updated ? { ...prev, ...updated } : prev;
+      });
     } catch (e) {
       console.error('Failed to fetch vehicles:', e);
     } finally {
@@ -44,20 +66,74 @@ export default function AssetsPage() {
     }
   }, []);
 
+  const fetchHistory = useCallback(async (vehicleId: number) => {
+    try {
+      const h = await api.getVehicleHistory(vehicleId);
+      setHistory(h);
+    } catch (e) {
+      console.error('Failed to fetch maintenance history:', e);
+      setHistory([]);
+    }
+  }, []);
+
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => fetchVehicles(), 1500);
+  }, [fetchVehicles]);
+
   useEffect(() => {
     fetchFleets();
     fetchVehicles();
+    const interval = setInterval(fetchVehicles, 15_000);
+    return () => clearInterval(interval);
   }, [fetchFleets, fetchVehicles]);
+
+  useEffect(() => {
+    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
+      const msg = wsMessages[i];
+      if (msg.channel === 'ws:health') {
+        const vehicleId = msg.data?.vehicle_id;
+        const health = msg.data?.health;
+        if (vehicleId && health) {
+          setVehicles((prev) =>
+            sortVehicles(
+              prev.map((v) =>
+                v.id === vehicleId ? { ...v, health: health as AssetHealth } : v
+              )
+            )
+          );
+          setSelectedVehicle((prev) => {
+            if (!prev || prev.id !== vehicleId) return prev;
+            return { ...prev, health: health as AssetHealth };
+          });
+        }
+      } else if (msg.channel === 'ws:alerts' || msg.channel === 'ws:workorders') {
+        scheduleRefresh();
+        if (selectedVehicle && msg.channel === 'ws:workorders') {
+          const vehicleId = msg.data?.vehicle_id;
+          if (vehicleId === selectedVehicle.id) {
+            fetchHistory(selectedVehicle.id);
+          }
+        }
+      }
+    }
+    lastWsIdx.current = wsMessages.length;
+  }, [wsMessages, scheduleRefresh, selectedVehicle, fetchHistory]);
 
   const selectVehicle = useCallback(async (v: Vehicle) => {
     setSelectedVehicle(v);
     setSelectedComponent(null);
     setSensors([]);
+    setHistory([]);
     try {
-      const c = await api.getComponents(v.id);
+      const [c, h] = await Promise.all([
+        api.getComponents(v.id),
+        api.getVehicleHistory(v.id),
+      ]);
       setComponents(c);
+      setHistory(h);
     } catch (e) {
-      console.error('Failed to fetch components:', e);
+      console.error('Failed to fetch vehicle details:', e);
     }
   }, []);
 
@@ -194,6 +270,50 @@ export default function AssetsPage() {
           </div>
         </section>
       </div>
+
+      {selectedVehicle && (
+        <section className="panel mt-4">
+          <header className="px-4 py-3 border-b border-gray-200">
+            <h2 className="font-semibold text-gray-900">
+              Maintenance history — {selectedVehicle.name}
+            </h2>
+          </header>
+          <div className="max-h-[320px] overflow-y-auto">
+            {history.length === 0 ? (
+              <p className="px-4 py-8 text-sm text-gray-500 text-center">
+                No maintenance events recorded yet.
+              </p>
+            ) : (
+              <ul className="divide-y divide-gray-100">
+                {history.map((entry) => (
+                  <li key={entry.id} className="px-4 py-3">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="font-medium text-gray-900">{entry.title}</p>
+                        {entry.description && (
+                          <p className="text-sm text-gray-600 mt-0.5">{entry.description}</p>
+                        )}
+                        {entry.performed_by && (
+                          <p className="text-xs text-gray-500 mt-1">By {entry.performed_by}</p>
+                        )}
+                      </div>
+                      <div className="text-right shrink-0">
+                        <Badge tone="neutral">{entry.event_type.replace('_', ' ')}</Badge>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {new Date(entry.event_date).toLocaleString()}
+                        </p>
+                        {entry.work_order_id && (
+                          <p className="text-xs text-gray-400">WO #{entry.work_order_id}</p>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

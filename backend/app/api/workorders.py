@@ -20,7 +20,7 @@ from app.db.models import (
     WorkOrderStatus,
     WorkOrderPriority,
 )
-from app.db.redis_client import publish_work_order
+from app.db.redis_client import publish_alert, publish_work_order
 from app.schemas.schemas import (
     MessageOut,
     WorkOrderAssign,
@@ -29,8 +29,32 @@ from app.schemas.schemas import (
     WorkOrderOut,
     WorkOrderUpdate,
 )
+from app.services.health import recompute_and_publish
 
 router = APIRouter(prefix="/workorders", tags=["work orders"])
+
+
+async def _alert_to_out_for_publish(db: AsyncSession, alert: Alert) -> dict:
+    """Build alert dict for WebSocket publish."""
+    vehicle_name = None
+    if alert.vehicle_id:
+        vr = await db.execute(select(Vehicle.name).where(Vehicle.id == alert.vehicle_id))
+        vehicle_name = vr.scalar_one_or_none()
+    return {
+        "id": alert.id,
+        "vehicle_id": alert.vehicle_id,
+        "vehicle_name": vehicle_name,
+        "rule_id": alert.rule_id,
+        "sensor_id": alert.sensor_id,
+        "severity": alert.severity.value if hasattr(alert.severity, "value") else alert.severity,
+        "status": alert.status.value if hasattr(alert.status, "value") else alert.status,
+        "title": alert.title,
+        "message": alert.message,
+        "trigger_value": alert.trigger_value,
+        "trigger_timestamp": alert.trigger_timestamp.isoformat() if alert.trigger_timestamp else None,
+        "work_order_id": alert.work_order_id,
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
+    }
 
 
 async def _wo_to_out(db: AsyncSession, wo: WorkOrder) -> WorkOrderOut:
@@ -160,12 +184,20 @@ async def complete_work_order(wo_id: int, data: WorkOrderComplete, db: AsyncSess
     if wo.alert_id:
         alert_result = await db.execute(select(Alert).where(Alert.id == wo.alert_id))
         alert = alert_result.scalar_one_or_none()
-        if alert and alert.status == AlertStatus.ACTIVE:
+        if alert and alert.status in (AlertStatus.ACTIVE, AlertStatus.ACKNOWLEDGED):
             alert.status = AlertStatus.RESOLVED
 
     await db.flush()
     out = await _wo_to_out(db, wo)
     await publish_work_order(out.model_dump(mode="json"))
+
+    if wo.alert_id:
+        alert_result = await db.execute(select(Alert).where(Alert.id == wo.alert_id))
+        alert = alert_result.scalar_one_or_none()
+        if alert and alert.status == AlertStatus.RESOLVED:
+            await publish_alert(await _alert_to_out_for_publish(db, alert))
+
+    await recompute_and_publish(db, wo.vehicle_id)
     return out
 
 
@@ -195,8 +227,42 @@ async def cancel_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
     if wo.status in (WorkOrderStatus.COMPLETED, WorkOrderStatus.CLOSED):
         raise HTTPException(status_code=400, detail="Cannot cancel completed/closed work orders")
     wo.status = WorkOrderStatus.CANCELLED
+
+    if wo.alert_id and wo.is_shadow:
+        alert_result = await db.execute(select(Alert).where(Alert.id == wo.alert_id))
+        alert = alert_result.scalar_one_or_none()
+        if alert and alert.status in (AlertStatus.ACTIVE, AlertStatus.ACKNOWLEDGED):
+            alert.status = AlertStatus.SUPPRESSED
+
     await db.flush()
-    return await _wo_to_out(db, wo)
+    out = await _wo_to_out(db, wo)
+    await publish_work_order(out.model_dump(mode="json"))
+
+    if wo.alert_id and wo.is_shadow:
+        alert_result = await db.execute(select(Alert).where(Alert.id == wo.alert_id))
+        alert = alert_result.scalar_one_or_none()
+        if alert and alert.status == AlertStatus.SUPPRESSED:
+            await publish_alert(await _alert_to_out_for_publish(db, alert))
+
+    await recompute_and_publish(db, wo.vehicle_id)
+    return out
+
+
+@router.post("/{wo_id}/approve", response_model=WorkOrderOut)
+async def approve_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
+    """Promote a shadow work order to open status for live maintenance."""
+    result = await db.execute(select(WorkOrder).where(WorkOrder.id == wo_id))
+    wo = result.scalar_one_or_none()
+    if not wo:
+        raise HTTPException(status_code=404, detail="Work order not found")
+    if wo.status != WorkOrderStatus.SHADOW or not wo.is_shadow:
+        raise HTTPException(status_code=400, detail="Only shadow work orders can be approved")
+    wo.status = WorkOrderStatus.OPEN
+    wo.is_shadow = False
+    await db.flush()
+    out = await _wo_to_out(db, wo)
+    await publish_work_order(out.model_dump(mode="json"))
+    return out
 
 
 @router.delete("/{wo_id}", status_code=204)

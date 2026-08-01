@@ -12,6 +12,7 @@ from app.db.database import get_db
 from app.db.redis_client import publish_alert
 from app.db.models import Alert, AlertStatus, Vehicle
 from app.schemas.schemas import AlertOut, MessageOut
+from app.services.health import recompute_and_publish
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -73,6 +74,8 @@ async def acknowledge_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
     await db.flush()
     out = await _alert_to_out(db, alert)
     await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
     return out
 
 
@@ -86,6 +89,8 @@ async def resolve_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
     await db.flush()
     out = await _alert_to_out(db, alert)
     await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
     return out
 
 
@@ -97,4 +102,8 @@ async def suppress_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.status = AlertStatus.SUPPRESSED
     await db.flush()
-    return await _alert_to_out(db, alert)
+    out = await _alert_to_out(db, alert)
+    await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
+    return out

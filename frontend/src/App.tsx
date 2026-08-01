@@ -78,7 +78,7 @@ function App() {
       <main className="flex-1 overflow-auto">
         <Routes>
           <Route path="/" element={<DashboardPage wsMessages={wsMessages} />} />
-          <Route path="/assets" element={<AssetsPage />} />
+          <Route path="/assets" element={<AssetsPage wsMessages={wsMessages} />} />
           <Route path="/workorders" element={<WorkOrdersPage wsMessages={wsMessages} />} />
           <Route path="/alerts" element={<AlertsPage wsMessages={wsMessages} />} />
           <Route path="/rules" element={<RulesPage />} />

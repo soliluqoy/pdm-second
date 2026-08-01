@@ -23,7 +23,7 @@ const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> =
 export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: Props) {
   const ts = vehicle.telemetry_timestamp ?? vehicle.last_seen;
   const lastUpdate = ts ? formatDistanceToNow(new Date(ts), { addSuffix: true }) : 'never';
-  const stale = ts ? now - new Date(ts).getTime() > 30_000 : true;
+  const stale = ts ? now - new Date(ts).getTime() > 300_000 : true;
 
   return (
     <div className="panel overflow-hidden">

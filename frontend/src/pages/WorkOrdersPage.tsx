@@ -2,8 +2,9 @@
  * PREDICT — Work Orders Page
  */
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { WorkOrder, WorkOrderStatus, WSMessage } from '../types';
+import type { WorkOrder, WorkOrderPriority, WorkOrderStatus, WSMessage } from '../types';
 import Badge from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import FilterBar from '../components/ui/FilterBar';
@@ -29,30 +30,45 @@ const priorityTone: Record<string, 'danger' | 'warning' | 'info' | 'neutral'> = 
 export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[] }) {
   const [workOrders, setWorkOrders] = useState<WorkOrder[]>([]);
   const [loading, setLoading] = useState(true);
+  const [shadowMode, setShadowMode] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('');
+  const [filterPriority, setFilterPriority] = useState<string>('');
   const [selectedWO, setSelectedWO] = useState<WorkOrder | null>(null);
   const [showCompleteModal, setShowCompleteModal] = useState(false);
   const [completedBy, setCompletedBy] = useState('tech1');
   const [completionNotes, setCompletionNotes] = useState('');
   const lastWsIdx = useRef(0);
   const refreshTimer = useRef<number | null>(null);
+  const shadowDefaultApplied = useRef(false);
 
   const fetchWorkOrders = useCallback(async () => {
     try {
-      const params = filterStatus ? { status: filterStatus } : undefined;
-      const wos = await api.getWorkOrders(params);
+      const params: { status?: string; priority?: string } = {};
+      if (filterStatus) params.status = filterStatus;
+      if (filterPriority) params.priority = filterPriority;
+      const wos = await api.getWorkOrders(Object.keys(params).length ? params : undefined);
       setWorkOrders(wos);
     } catch (e) {
       console.error('Failed to fetch work orders:', e);
     } finally {
       setLoading(false);
     }
-  }, [filterStatus]);
+  }, [filterStatus, filterPriority]);
 
   const scheduleRefresh = useCallback(() => {
     if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
     refreshTimer.current = window.setTimeout(() => fetchWorkOrders(), 1000);
   }, [fetchWorkOrders]);
+
+  useEffect(() => {
+    api.getShadowMode().then((r) => {
+      setShadowMode(r.shadow_mode);
+      if (r.shadow_mode && !shadowDefaultApplied.current) {
+        shadowDefaultApplied.current = true;
+        setFilterStatus('shadow');
+      }
+    }).catch(console.error);
+  }, []);
 
   useEffect(() => {
     fetchWorkOrders();
@@ -91,6 +107,15 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
     }
   };
 
+  const handleClose = async (id: number) => {
+    try {
+      await api.closeWorkOrder(id);
+      fetchWorkOrders();
+    } catch (e) {
+      console.error('Failed to close:', e);
+    }
+  };
+
   const handleCancel = async (id: number) => {
     try {
       await api.cancelWorkOrder(id);
@@ -100,7 +125,17 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
     }
   };
 
+  const handleApprove = async (id: number) => {
+    try {
+      await api.approveWorkOrder(id);
+      fetchWorkOrders();
+    } catch (e) {
+      console.error('Failed to approve:', e);
+    }
+  };
+
   const statusFilters: (WorkOrderStatus | '')[] = ['', 'shadow', 'open', 'in_progress', 'completed', 'closed'];
+  const priorityFilters: (WorkOrderPriority | '')[] = ['', 'urgent', 'high', 'medium', 'low'];
 
   if (loading) {
     return <LoadingState message="Loading work orders…" />;
@@ -113,6 +148,15 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
         description={`${workOrders.length} work order${workOrders.length === 1 ? '' : 's'} shown`}
       />
 
+      {shadowMode && (
+        <div className="mb-4 rounded-lg border border-purple-200 bg-purple-50 px-4 py-3">
+          <p className="text-sm font-medium text-purple-900">Shadow mode active</p>
+          <p className="text-sm text-purple-700 mt-0.5">
+            Review auto-generated work orders before they go live. Approve to promote to open, or discard to cancel.
+          </p>
+        </div>
+      )}
+
       <FilterBar
         filters={[
           {
@@ -123,6 +167,16 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
             options: statusFilters.map((s) => ({
               value: s,
               label: s ? s.replace('_', ' ') : 'All',
+            })),
+          },
+          {
+            id: 'priority',
+            label: 'Priority',
+            value: filterPriority,
+            onChange: setFilterPriority,
+            options: priorityFilters.map((p) => ({
+              value: p,
+              label: p || 'All',
             })),
           },
         ]}
@@ -140,6 +194,7 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                 <th>Vehicle</th>
                 <th>Priority</th>
                 <th>Status</th>
+                <th>Alert</th>
                 <th>Assigned</th>
                 <th>Created</th>
                 <th>Actions</th>
@@ -162,11 +217,30 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                       {wo.status.replace('_', ' ')}
                     </Badge>
                   </td>
+                  <td>
+                    {wo.alert_id ? (
+                      <Link to="/alerts" className="text-predict-600 hover:underline text-sm">
+                        #{wo.alert_id}
+                      </Link>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td>{wo.assigned_to || '—'}</td>
                   <td className="text-gray-600">{new Date(wo.created_at).toLocaleString()}</td>
                   <td>
                     <div className="flex flex-wrap gap-2">
-                      {(wo.status === 'open' || wo.status === 'shadow') && (
+                      {shadowMode && wo.status === 'shadow' && wo.is_shadow && (
+                        <>
+                          <button onClick={() => handleApprove(wo.id)} className="btn-primary">
+                            Approve
+                          </button>
+                          <button onClick={() => handleCancel(wo.id)} className="btn-danger">
+                            Discard
+                          </button>
+                        </>
+                      )}
+                      {(wo.status === 'open' || (wo.status === 'shadow' && !shadowMode)) && (
                         <button onClick={() => handleAssign(wo.id)} className="btn-secondary">
                           Assign
                         </button>
@@ -182,10 +256,17 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                           >
                             Complete
                           </button>
-                          <button onClick={() => handleCancel(wo.id)} className="btn-danger">
-                            Cancel
-                          </button>
+                          {!(shadowMode && wo.status === 'shadow' && wo.is_shadow) && (
+                            <button onClick={() => handleCancel(wo.id)} className="btn-danger">
+                              Cancel
+                            </button>
+                          )}
                         </>
+                      )}
+                      {wo.status === 'completed' && (
+                        <button onClick={() => handleClose(wo.id)} className="btn-secondary">
+                          Close
+                        </button>
                       )}
                     </div>
                   </td>

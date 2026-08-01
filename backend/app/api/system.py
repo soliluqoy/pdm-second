@@ -17,6 +17,7 @@ from app.schemas.schemas import (
     SystemConfigOut,
     SystemConfigUpdate,
 )
+from app.services.telemetry_reset import reset_telemetry_data
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -83,6 +84,17 @@ async def set_shadow_mode(enabled: bool, db: AsyncSession = Depends(get_db)):
     # Update runtime setting
     settings.SHADOW_MODE = enabled
     return {"shadow_mode": enabled}
+
+
+@router.post("/reset-telemetry", response_model=dict)
+async def reset_telemetry(db: AsyncSession = Depends(get_db)):
+    """Wipe all ingested telemetry, alerts, work orders, and Redis live cache.
+
+    Vehicle registration and sensor catalog are preserved. Use after removing
+    test/simulated data or to start fresh before connecting real hardware.
+    """
+    counts = await reset_telemetry_data(db)
+    return {"status": "ok", **counts}
 
 
 # =============================================================================

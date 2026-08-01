@@ -145,6 +145,12 @@ class ApiClient {
     });
   }
 
+  approveWorkOrder(id: number) {
+    return this.request<WorkOrder>(`/workorders/${id}/approve`, {
+      method: 'POST',
+    });
+  }
+
   // ── Alerts ──────────────────────────────────────────────────────────────────
   getAlerts(params?: { status?: string; severity?: string; vehicle_id?: number }) {
     const query = new URLSearchParams();
@@ -191,6 +197,10 @@ class ApiClient {
   getMaintenanceHistory(vehicleId?: number) {
     const query = vehicleId ? `?vehicle_id=${vehicleId}` : '';
     return this.request<MaintenanceHistory[]>(`/system/history${query}`);
+  }
+
+  getVehicleHistory(vehicleId: number) {
+    return this.request<MaintenanceHistory[]>(`/system/history/vehicle/${vehicleId}`);
   }
 
   // ── Health ──────────────────────────────────────────────────────────────────

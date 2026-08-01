@@ -49,6 +49,14 @@ async def get_all_vehicle_states() -> dict:
     return states
 
 
+async def clear_all_vehicle_states() -> int:
+    """Delete all cached vehicle state keys. Returns count deleted."""
+    keys = [key async for key in redis_client.scan_iter(match="vehicle:*:state")]
+    if keys:
+        await redis_client.delete(*keys)
+    return len(keys)
+
+
 # ── Helpers: WebSocket pub/sub ────────────────────────────────────────────────
 async def publish_event(channel: str, payload: Any) -> None:
     """Publish an event to a Redis pub/sub channel for WebSocket fan-out."""
