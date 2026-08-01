@@ -2,7 +2,7 @@
 PREDICT — Pydantic Schemas (API request/response models)
 """
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -61,6 +61,7 @@ class VehicleBase(BaseModel):
     year: Optional[int] = None
     vin: Optional[str] = None
     imei: str = Field(..., max_length=20)
+    device_type: Literal["fmc001", "fmc150"] = "fmc001"
     fleet_id: Optional[int] = None
     is_active: bool = True
 
@@ -77,6 +78,7 @@ class VehicleUpdate(BaseModel):
     year: Optional[int] = None
     vin: Optional[str] = None
     imei: Optional[str] = None
+    device_type: Optional[Literal["fmc001", "fmc150"]] = None
     fleet_id: Optional[int] = None
     is_active: Optional[bool] = None
 

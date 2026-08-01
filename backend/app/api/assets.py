@@ -34,8 +34,10 @@ from app.schemas.schemas import (
     VehicleOut,
     VehicleUpdate,
 )
+from app.services.provisioning import provision_vehicle
 
 router = APIRouter(prefix="/assets", tags=["assets"])
+
 
 
 # =============================================================================
@@ -139,7 +141,8 @@ async def _vehicle_to_out(db: AsyncSession, v: Vehicle) -> VehicleOut:
 
     return VehicleOut(
         id=v.id, name=v.name, license_plate=v.license_plate, make=v.make,
-        model=v.model, year=v.year, vin=v.vin, imei=v.imei, fleet_id=v.fleet_id,
+        model=v.model, year=v.year, vin=v.vin, imei=v.imei, device_type=v.device_type,
+        fleet_id=v.fleet_id,
         is_active=v.is_active, health=v.health, last_seen=v.last_seen,
         fleet_name=fleet_name, component_count=component_count,
         active_alert_count=active_alert_count, open_work_order_count=open_wo_count,
@@ -178,8 +181,34 @@ async def create_vehicle(data: VehicleCreate, db: AsyncSession = Depends(get_db)
     return await _vehicle_to_out(db, vehicle)
 
 
+@router.post("/vehicles/register", response_model=VehicleOut, status_code=201)
+async def register_vehicle(
+    data: VehicleCreate,
+    provision: bool = Query(True, description="Attach catalog components + sensors"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Register a REAL Teltonika-equipped vehicle (FMC001 OBD-II or FMC150 CAN).
+
+    Creates the vehicle (keyed by device IMEI) and, by default, provisions the
+    component/sensor catalog matching its device_type from
+    app/services/provisioning.py so the dashboard and rule engine have known
+    sensor types the moment the first record arrives.
+    """
+    existing = await db.execute(select(Vehicle).where(Vehicle.imei == data.imei))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Vehicle with IMEI {data.imei} already exists")
+    vehicle = Vehicle(**data.model_dump())
+    db.add(vehicle)
+    await db.flush()
+    if provision:
+        await provision_vehicle(db, vehicle)
+    await db.flush()
+    return await _vehicle_to_out(db, vehicle)
+
+
 @router.get("/vehicles/{vehicle_id}", response_model=VehicleOut)
 async def get_vehicle(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+
     result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
     vehicle = result.scalar_one_or_none()
     if not vehicle:

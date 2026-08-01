@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     MQTT_PORT: int = 1883
     MQTT_USERNAME: str = "predict_sim"
     MQTT_PASSWORD: str = "predict_sim_pass"
-    MQTT_TELEMETRY_TOPIC: str = "fmc150/+/telemetry"
-    MQTT_DTC_TOPIC: str = "fmc150/+/dtc"
+    MQTT_TELEMETRY_TOPIC: str = "teltonika/+/telemetry"
+    MQTT_DTC_TOPIC: str = "teltonika/+/dtc"
 
     # ── Backend ───────────────────────────────────────────────────────────────
     BACKEND_HOST: str = "0.0.0.0"
@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     # When True, generated work orders are created in "shadow" status for review
     # rather than "open" status for immediate action.
     SHADOW_MODE: bool = True
+
+    # ── Rule engine freshness guard ───────────────────────────────────────────
+    # FMC150 devices buffer records when out of coverage and burst-upload them
+    # later. Readings are always STORED, but rules are only evaluated for
+    # records fresher than this — replayed history must not fire phantom alerts.
+    RULE_MAX_RECORD_AGE_SECONDS: int = 300
+
+    # Dashboard live tiles: Redis snapshots older than this are treated as offline
+    # (no sensor values, ignition, or speed shown).
+    TELEMETRY_LIVE_MAX_AGE_SECONDS: int = 300
+
 
     @field_validator("CORS_ORIGINS")
     @classmethod

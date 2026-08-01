@@ -1,11 +1,12 @@
 """
 PREDICT — MQTT Ingestion Service
-Subscribes to FMC150 telemetry/DTC topics, stores readings in TimescaleDB,
-updates Redis latest-state cache, and triggers the rule engine.
+Subscribes to Teltonika telemetry/DTC topics (FMC001 + FMC150), stores readings
+in TimescaleDB, updates Redis latest-state cache, and triggers the rule engine.
 
-This is the "adapter seam": the simulator and real FMC150 both publish to the
-same topic schema (fmc150/{imei}/telemetry) with the same JSON payload shape.
-The backend knows nothing about whether the source is real or simulated.
+This is the "adapter seam": the fmc-bridge service (bridge/) decodes each
+tracker's Teltonika AVL protocol and republishes here as JSON on
+teltonika/{imei}/telemetry — so this service needs zero hardware knowledge.
+
 """
 import asyncio
 import json
@@ -66,7 +67,7 @@ class MQTTIngestionService:
             logger.error("Failed to parse MQTT payload on topic %s: %s", topic, e)
             return
 
-        # Extract IMEI from topic: fmc150/{imei}/telemetry or fmc150/{imei}/dtc
+        # Extract IMEI from topic: teltonika/{imei}/telemetry or teltonika/{imei}/dtc
         parts = topic.split("/")
         if len(parts) < 3:
             logger.warning("Unexpected topic format: %s", topic)
@@ -92,7 +93,7 @@ class MQTTIngestionService:
                 logger.warning("Telemetry from unknown IMEI: %s", imei)
                 return
 
-            # Parse FMC150-style payload
+            # Parse bridge payload
             # Expected format: { "timestamp": "...", "gps": {...}, "sensors": {...} }
             ts = self._parse_timestamp(data.get("timestamp"))
 
@@ -166,10 +167,19 @@ class MQTTIngestionService:
             if was_grey:
                 await publish_health_update(vehicle.id, AssetHealth.GREEN.value)
 
-            try:
-                await evaluate_telemetry(vehicle.id, imei, sensors, ts)
-            except Exception as e:
-                logger.error("Rule engine error: %s", e)
+            # Freshness guard: the tracker buffers records when out of coverage and
+            # burst-uploads them later. Everything above is STORED, but rules
+            # only run on fresh data — replayed history must not fire alerts.
+            record_age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if record_age <= settings.RULE_MAX_RECORD_AGE_SECONDS:
+                try:
+                    await evaluate_telemetry(vehicle.id, imei, sensors, ts)
+                except Exception as e:
+                    logger.error("Rule engine error: %s", e)
+            else:
+                logger.debug("Skipping rule evaluation: stale record "
+                             "(age=%.0fs) vehicle=%s", record_age, vehicle.name)
+
 
             logger.debug("Ingested %d readings for vehicle %s (IMEI %s)",
                          len(readings_added), vehicle.name, imei)
@@ -192,10 +202,20 @@ class MQTTIngestionService:
             logger.info("DTC received: vehicle=%s IMEI=%s code=%s desc=%s",
                         vehicle.name, imei, dtc_code, description)
 
+            # Freshness guard — same rationale as telemetry (buffered uploads
+            # from the device must not fire alerts for old faults).
+            ts = self._parse_timestamp(data.get("timestamp"))
+            record_age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if record_age > settings.RULE_MAX_RECORD_AGE_SECONDS:
+                logger.debug("Skipping stale DTC (age=%.0fs) vehicle=%s code=%s",
+                             record_age, vehicle.name, dtc_code)
+                return
+
             try:
                 await evaluate_dtc(vehicle.id, imei, dtc_code, description, severity)
             except Exception as e:
                 logger.error("DTC rule engine error: %s", e)
+
 
     @staticmethod
     def _parse_timestamp(timestamp_str: Optional[str]) -> datetime:

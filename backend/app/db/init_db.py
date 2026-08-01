@@ -1,8 +1,12 @@
 """
 PREDICT — Database Initialization & Seed Data
 Creates all tables, enables TimescaleDB, converts sensor_readings to hypertable,
-migrates legacy naive timestamp columns to timestamptz, and seeds demo
-fleet/vehicles/components/sensors/rules/templates.
+migrates legacy naive timestamp columns to timestamptz, and seeds OPERATIONAL
+data only (users, work-order templates, rules, system config).
+
+No demo fleet/vehicles are seeded — real vehicles are registered via
+POST /api/v1/assets/vehicles/register and provisioned from
+app/services/provisioning.py (SENSOR_CATALOG with real Teltonika AVL IDs).
 """
 import asyncio
 import logging
@@ -12,86 +16,17 @@ from sqlalchemy import text
 from app.db.database import Base, engine, async_session_factory
 from app.db.models import (
     AlertSeverity,
-    AssetHealth,
-    Component,
-    Fleet,
     Rule,
     RuleType,
-    Sensor,
     SystemConfig,
     User,
     UserRole,
-    Vehicle,
     WorkOrderPriority,
-    WorkOrderStatus,
     WorkOrderTemplate,
 )
 
 logger = logging.getLogger("predict.init")
 
-
-# ── Seed Data Definitions ─────────────────────────────────────────────────────
-SEED_FLEET = {
-    "name": "Delivery Fleet Alpha",
-    "description": "Primary delivery fleet — 5 vehicles equipped with Teltonika FMC150",
-}
-
-# 5 simulated vehicles with realistic IMEIs
-SEED_VEHICLES = [
-    {"name": "Truck-001", "license_plate": "DLV-1001", "make": "Ford", "model": "Transit",
-     "year": 2022, "vin": "1FTBR1X80NNA10001", "imei": "350424061234001"},
-    {"name": "Truck-002", "license_plate": "DLV-1002", "make": "Mercedes", "model": "Sprinter",
-     "year": 2023, "vin": "WDB9066351L100002", "imei": "350424061234002"},
-    {"name": "Van-003", "license_plate": "DLV-1003", "make": "Ford", "model": "Transit Connect",
-     "year": 2021, "vin": "1FTBR1X80MNA100003", "imei": "350424061234003"},
-    {"name": "Truck-004", "license_plate": "DLV-1004", "make": "Iveco", "model": "Daily",
-     "year": 2023, "vin": "ZCFA55A12NNA100004", "imei": "350424061234004"},
-    {"name": "Van-005", "license_plate": "DLV-1005", "make": "Renault", "model": "Master",
-     "year": 2022, "vin": "VF1MA000000100005", "imei": "350424061234005"},
-]
-
-# Standard components per vehicle
-SEED_COMPONENTS = [
-    {"name": "Engine", "component_type": "engine", "description": "Main engine system"},
-    {"name": "Transmission", "component_type": "transmission", "description": "Gearbox and drivetrain"},
-    {"name": "Brakes", "component_type": "brake", "description": "Braking system"},
-    {"name": "Tires", "component_type": "tire", "description": "Tire pressure and condition"},
-    {"name": "Electrical", "component_type": "electrical", "description": "Battery and alternator"},
-]
-
-# Standard sensors per component (mapped to FMC150 IO elements)
-SEED_SENSORS = [
-    # Engine sensors
-    {"component": "Engine", "name": "Engine RPM", "sensor_type": "engine_rpm", "unit": "RPM",
-     "io_element_id": 16, "min_value": 0, "max_value": 6000, "warning_threshold": 4500, "critical_threshold": 5500},
-    {"component": "Engine", "name": "Coolant Temperature", "sensor_type": "coolant_temperature", "unit": "°C",
-     "io_element_id": 74, "min_value": 0, "max_value": 130, "warning_threshold": 100, "critical_threshold": 110},
-    {"component": "Engine", "name": "Engine Load", "sensor_type": "engine_load", "unit": "%",
-     "io_element_id": 47, "min_value": 0, "max_value": 100, "warning_threshold": 80, "critical_threshold": 95},
-    {"component": "Engine", "name": "Oil Pressure", "sensor_type": "oil_pressure", "unit": "kPa",
-     "io_element_id": 73, "min_value": 0, "max_value": 500, "warning_threshold": 400, "critical_threshold": 450},
-    # Transmission
-    {"component": "Transmission", "name": "Transmission Temperature", "sensor_type": "transmission_temperature", "unit": "°C",
-     "io_element_id": 158, "min_value": 0, "max_value": 150, "warning_threshold": 100, "critical_threshold": 120},
-    # Brakes
-    {"component": "Brakes", "name": "Brake Pressure", "sensor_type": "brake_pressure", "unit": "kPa",
-     "io_element_id": 182, "min_value": 0, "max_value": 10000, "warning_threshold": 8000, "critical_threshold": 9000},
-    # Tires
-    {"component": "Tires", "name": "Tire Pressure FL", "sensor_type": "tire_pressure_fl", "unit": "kPa",
-     "io_element_id": 200, "min_value": 0, "max_value": 500, "warning_threshold": 250, "critical_threshold": 200},
-    # Electrical
-    {"component": "Electrical", "name": "Battery Voltage", "sensor_type": "battery_voltage", "unit": "V",
-     "io_element_id": 24, "min_value": 0, "max_value": 15, "warning_threshold": 12.5, "critical_threshold": 11.5},
-    # Vehicle-level (no specific component, mapped to Engine for simplicity)
-    {"component": "Engine", "name": "Vehicle Speed", "sensor_type": "vehicle_speed", "unit": "km/h",
-     "io_element_id": 0, "min_value": 0, "max_value": 200, "warning_threshold": 150, "critical_threshold": 180},
-    {"component": "Engine", "name": "Fuel Level", "sensor_type": "fuel_level", "unit": "%",
-     "io_element_id": 2, "min_value": 0, "max_value": 100, "warning_threshold": 20, "critical_threshold": 10},
-    {"component": "Engine", "name": "Odometer", "sensor_type": "odometer", "unit": "km",
-     "io_element_id": 1, "min_value": 0, "max_value": 1000000, "warning_threshold": None, "critical_threshold": None},
-    {"component": "Engine", "name": "Engine Hours", "sensor_type": "engine_hours", "unit": "h",
-     "io_element_id": 3, "min_value": 0, "max_value": 50000, "warning_threshold": None, "critical_threshold": None},
-]
 
 # Work order templates
 SEED_TEMPLATES = [
@@ -113,6 +48,9 @@ SEED_TEMPLATES = [
     {"name": "Tire Pressure Check", "description": "Tire pressure outside normal range. Inspect and adjust tire pressure, check for punctures.",
      "default_priority": WorkOrderPriority.MEDIUM, "estimated_duration_minutes": 30,
      "instructions": "1. Check all tire pressures\n2. Inflate to manufacturer spec\n3. Inspect for punctures or damage\n4. Check valve stems"},
+    {"name": "Scheduled Maintenance", "description": "Vehicle is approaching (or past) its manufacturer service interval. Book a service appointment and perform the scheduled inspection.",
+     "default_priority": WorkOrderPriority.MEDIUM, "estimated_duration_minutes": 120,
+     "instructions": "1. Review service countdown and odometer\n2. Book service appointment\n3. Perform manufacturer scheduled maintenance items\n4. Reset service interval on the vehicle"},
 ]
 
 # Rules (threshold + DTC). Templates are referenced by NAME ("work_order_template")
@@ -152,6 +90,22 @@ SEED_RULES = [
      "rule_type": RuleType.THRESHOLD, "sensor_type": "tire_pressure_fl",
      "operator": "<", "threshold_value": 200, "duration_seconds": 0,
      "severity": AlertSeverity.WARNING, "work_order_template": "Tire Pressure Check"},
+    {"name": "Service Due Soon", "description": "Less than 1000 km to scheduled service",
+     "rule_type": RuleType.THRESHOLD, "sensor_type": "distance_until_service",
+     "operator": "<", "threshold_value": 1000, "duration_seconds": 0,
+     "severity": AlertSeverity.WARNING, "work_order_template": "Scheduled Maintenance"},
+    {"name": "Service Overdue", "description": "Less than 100 km to scheduled service",
+     "rule_type": RuleType.THRESHOLD, "sensor_type": "distance_until_service",
+     "operator": "<", "threshold_value": 100, "duration_seconds": 0,
+     "severity": AlertSeverity.CRITICAL, "work_order_template": "Scheduled Maintenance"},
+    {"name": "High Engine Oil Temperature", "description": "Engine oil temp > 125°C",
+     "rule_type": RuleType.THRESHOLD, "sensor_type": "engine_oil_temperature",
+     "operator": ">", "threshold_value": 125, "duration_seconds": 300,
+     "severity": AlertSeverity.WARNING, "work_order_template": "Engine Overheat Inspection"},
+    {"name": "Low Control Module Voltage", "description": "ECU supply voltage < 12V (charging system)",
+     "rule_type": RuleType.THRESHOLD, "sensor_type": "control_module_voltage",
+     "operator": "<", "threshold_value": 12, "duration_seconds": 300,
+     "severity": AlertSeverity.WARNING, "work_order_template": "Low Battery Voltage"},
     # DTC rules
     {"name": "DTC P0128 - Thermostat", "description": "Engine coolant thermostat below regulating temperature",
      "rule_type": RuleType.DTC, "dtc_code": "P0128",
@@ -223,6 +177,20 @@ async def _migrate_naive_timestamps():
     logger.info("Legacy timestamp migration (naive → timestamptz) applied.")
 
 
+async def _migrate_device_type():
+    """Add vehicles.device_type on databases created before dual-tracker support.
+
+    create_all() never alters existing tables, so do it here. Idempotent;
+    existing vehicles default to 'fmc001' (the original OBD profile).
+    """
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE vehicles "
+            "ADD COLUMN IF NOT EXISTS device_type VARCHAR(20) NOT NULL DEFAULT 'fmc001'"
+        ))
+    logger.info("device_type migration applied (vehicles).")
+
+
 async def init_database():
     """Create all tables and set up TimescaleDB hypertable."""
     # Import all models to register them with Base
@@ -249,19 +217,26 @@ async def init_database():
     # Migrate any pre-existing naive timestamp columns to timestamptz
     await _migrate_naive_timestamps()
 
+    # Add columns introduced after the first schema (existing DBs only)
+    await _migrate_device_type()
+
     logger.info("Database tables created successfully.")
 
 
 async def seed_database():
-    """Seed the database with demo data if empty."""
+    """Seed OPERATIONAL data only: users, work-order templates, rules, config.
+
+    No demo fleet/vehicles — real vehicles are registered via the API and
+    provisioned from app/services/provisioning.py.
+    """
     async with async_session_factory() as session:
-        # Check if already seeded
-        result = await session.execute(text("SELECT COUNT(*) FROM fleets"))
+        # Check if already seeded (users table is our idempotency marker)
+        result = await session.execute(text("SELECT COUNT(*) FROM users"))
         if result.scalar() > 0:
             logger.info("Database already seeded, skipping.")
             return
 
-        logger.info("Seeding database with demo data...")
+        logger.info("Seeding operational data (users, templates, rules)...")
 
         # ── System Config ──────────────────────────────────────────────────────
         session.add(SystemConfig(
@@ -273,11 +248,6 @@ async def seed_database():
         for u in SEED_USERS:
             session.add(User(**u))
 
-        # ── Fleet ──────────────────────────────────────────────────────────────
-        fleet = Fleet(**SEED_FLEET)
-        session.add(fleet)
-        await session.flush()
-
         # ── Work Order Templates ───────────────────────────────────────────────
         templates = []
         for t in SEED_TEMPLATES:
@@ -285,30 +255,6 @@ async def seed_database():
             session.add(tpl)
             templates.append(tpl)
         await session.flush()
-
-        # ── Vehicles, Components, Sensors ──────────────────────────────────────
-        for vdata in SEED_VEHICLES:
-            vehicle = Vehicle(**vdata, fleet_id=fleet.id, health=AssetHealth.GREY)
-            session.add(vehicle)
-            await session.flush()
-
-            # Add components
-            comp_map = {}
-            for cdata in SEED_COMPONENTS:
-                comp = Component(**cdata, vehicle_id=vehicle.id)
-                session.add(comp)
-                comp_map[comp.name] = comp
-            await session.flush()
-
-            # Add sensors to components.
-            # NOTE: do NOT .pop("component") — that would mutate the shared
-            # SEED_SENSORS dicts and raise KeyError on the second vehicle.
-            for sdata in SEED_SENSORS:
-                comp = comp_map.get(sdata["component"])
-                if comp:
-                    sensor_kwargs = {k: v for k, v in sdata.items() if k != "component"}
-                    sensor = Sensor(**sensor_kwargs, component_id=comp.id)
-                    session.add(sensor)
 
         # ── Rules ──────────────────────────────────────────────────────────────
         # Resolve template names → actual IDs assigned by the database.
@@ -321,10 +267,10 @@ async def seed_database():
             session.add(Rule(**rule_kwargs))
 
         await session.commit()
-        logger.info("Database seeded: 1 fleet, %d vehicles, %d components each, "
-                    "%d sensors each, %d templates, %d rules, %d users",
-                    len(SEED_VEHICLES), len(SEED_COMPONENTS), len(SEED_SENSORS),
+        logger.info("Database seeded: %d templates, %d rules, %d users "
+                    "(no demo fleet — register real vehicles via API)",
                     len(SEED_TEMPLATES), len(SEED_RULES), len(SEED_USERS))
+
 
 
 async def run_init():

@@ -27,6 +27,13 @@ interface SelectedSensor {
   sensorType: string;
 }
 
+const healthOrder: Record<string, number> = {
+  red: 0,
+  yellow: 1,
+  green: 2,
+  grey: 3,
+};
+
 export default function DashboardPage({ wsMessages }: Props) {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [fleet, setFleet] = useState<VehicleLiveItem[]>([]);
@@ -44,7 +51,13 @@ export default function DashboardPage({ wsMessages }: Props) {
         api.getFleetLive(),
       ]);
       setSummary(s);
-      setFleet(f);
+      setFleet(
+        [...f].sort((a, b) => {
+          const healthDiff = (healthOrder[a.health] ?? 99) - (healthOrder[b.health] ?? 99);
+          if (healthDiff !== 0) return healthDiff;
+          return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
+        })
+      );
     } catch (e) {
       console.error('Failed to fetch dashboard data:', e);
     } finally {
@@ -190,7 +203,8 @@ export default function DashboardPage({ wsMessages }: Props) {
       <p className="text-sm text-gray-600 mb-4">Click a sensor for history and thresholds.</p>
 
       {fleet.length === 0 ? (
-        <EmptyState message="No vehicles found. Start the simulator to see live data." />
+        <EmptyState message="No vehicles yet. Register your Teltonika-equipped car (FMC001 or FMC150) via POST /api/v1/assets/vehicles/register — see FMC001-SETUP.md / FMC150-SETUP.md." />
+
       ) : (
         <div className="space-y-4">
           {fleet.map((v) => (
