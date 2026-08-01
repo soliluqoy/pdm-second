@@ -158,17 +158,41 @@ curl -X POST http://localhost:8000/api/v1/assets/vehicles/register \
 
 ### 2. Configure the tracker (external SMS)
 
-PREDICT does **not** send SMS. After register, use **SMS config helper** on
-Assets (or send from your phone using the SIM number you stored).
+PREDICT does **not** send SMS. The same templates are on
+http://localhost:5173/assets under **SMS config templates** (Copy buttons).
+Send from your phone to the **device SIM**.
 
 Both devices speak **Codec 8 Extended** over TCP to `<HOST>:5123`. Set
-`VITE_TRACKER_SERVER=<HOST>` in `.env` so the helper fills the template.
+`VITE_TRACKER_SERVER=<HOST>` in `.env` so the UI fills the host (otherwise it
+shows `<VPS_STATIC_IP>`). Messages need **two leading spaces** if the device
+has no SMS login/password.
 
-Example primary-server SMS (two leading spaces if no SMS login/password):
+**FMC001 — Second server (Duplicate)** — keep the current platform, also stream to PREDICT:
+
+```text
+  setparam 2010:2;2007:<HOST>;2008:5123;2009:0
+```
+
+| ID | Meaning |
+|----|---------|
+| 2010:2 | Second server = Duplicate |
+| 2007 | VPS IP / hostname |
+| 2008 | Port 5123 |
+| 2009:0 | TCP |
+
+**FMC150 / FMC001 — Primary server** — point the main server at PREDICT:
 
 ```text
   setparam 2001:YOUR_APN;2002:;2003:;2004:<HOST>;2005:5123;2006:0
 ```
+
+| ID | Meaning |
+|----|---------|
+| 2001 | APN (SIM operator; leave empty if Auto APN works) |
+| 2002 / 2003 | APN user / password (often empty) |
+| 2004 | VPS IP / hostname |
+| 2005 | Port 5123 |
+| 2006:0 | TCP |
 
 USB/Bluetooth Configurator works the same. Devices are store-and-forward; the
 rule engine skips records older than `RULE_MAX_RECORD_AGE_SECONDS` so buffered
