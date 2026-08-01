@@ -1,207 +1,436 @@
-# PREDICT — Predictive Maintenance CMSS
+# PREDICT — Predictive Maintenance CMMS
 
-> **Real car sensor data → Rule engine → Work orders → Technician feedback loop**
+Real Teltonika tracker data → MQTT → rule engine → alerts & work orders → live dashboard.
 
-A Predictive Maintenance (PdM) CMMS that automates the transition from "data
-anomaly" to "technician task." Driven by **real Teltonika trackers** — the
-**FMC001** (OBD-II plug-in) and/or the **FMC150** (wired CAN) — in your
-vehicles. No simulator, no seed data.
-
-**🚗 Connecting a car? Read [FMC001-SETUP.md](FMC001-SETUP.md)** — the exact
-checklist of information you need (IMEI, public endpoint, Codec 8 Extended,
-Duplicate-mode second server) and where each piece gets plugged in.
-*(Wired FMC150 CAN tracker instead? See [FMC150-SETUP.md](FMC150-SETUP.md).)*
-
-## Architecture
+Supported hardware: **FMC001** (OBD-II plug-in) and **FMC150** (wired CAN). No simulator.
 
 ```
-Car OBD-II port → FMC001 ┐
-                          ├→ 4G LTE → <VPS_STATIC_IP>:5123 → fmc-bridge (Codec 8E decode)
-Car CAN bus ───→ FMC150 ┘                                    ↓
-                              MQTT (Mosquitto) → FastAPI Backend → PostgreSQL/TimescaleDB + Redis
+Car OBD-II → FMC001 ┐
+                     ├─ 4G LTE → <HOST>:5123 → bridge (Codec 8/8E)
+Car CAN ───→ FMC150 ┘                              ↓
+                              MQTT (Mosquitto) → FastAPI → TimescaleDB + Redis
                                                        ↓
-                                          React Dashboard (WebSocket real-time)
+                                          React dashboard (WebSocket)
 ```
 
-| Service    | Port | Technology                            |
-|------------|------|---------------------------------------|
-| Frontend   | 5173 | React 18 + Vite 6 + Tailwind 3        |
-| Backend    | 8000 | FastAPI (Python 3.12)                 |
-| Bridge     | 5123 | Teltonika AVL (Codec 8/8E) TCP → MQTT |
-| PostgreSQL | 5432 | TimescaleDB 2.17 (PG 16)              |
-| Redis      | 6379 | Redis 7                               |
-| Mosquitto  | 1883 | Eclipse Mosquitto 2 (MQTT)            |
-| Mosquitto  | 9001 | MQTT over WebSocket (debug)           |
+| Service    | Port | Role                                      |
+|------------|------|-------------------------------------------|
+| Frontend   | 5173 | React 18 + Vite 6 + Tailwind              |
+| Backend    | 8000 | FastAPI — REST, WebSocket, MQTT ingestion |
+| Bridge     | 5123 | Teltonika AVL TCP → MQTT                  |
+| PostgreSQL | 5432 | TimescaleDB 2.17 (PG 16)                  |
+| Redis      | 6379 | Live state + pub/sub                      |
+| Mosquitto  | 1883 | MQTT (9001 = MQTT over WebSocket)         |
 
-## Quick Start
+---
 
-### Prerequisites
+## Prerequisites
 
-- **Docker Desktop** running (Compose v2), ~2 GB free RAM
-- Ports `5173`, `8000`, `5432`, `6379`, `1883`, `9001`, `5123` free
-- A **public TCP endpoint** for the trackers to reach the bridge — ideally a
-  **VPS with a static IP** (see "Hosting on a VPS" below; any always-on host
-  with port `5123` open works)
-- A **Teltonika FMC001 and/or FMC150** + M2M SIM (see
-  [FMC001-SETUP.md](FMC001-SETUP.md) / [FMC150-SETUP.md](FMC150-SETUP.md))
+- Docker Desktop (Compose v2), ~2 GB free RAM
+- Free ports: `5173`, `8000`, `5432`, `6379`, `1883`, `9001`, `5123`
+- A reachable TCP endpoint for trackers (`<HOST>:5123`) — VPS with static IP recommended
+- Teltonika FMC001 and/or FMC150 + active M2M SIM
 
-### 1 — Environment file
+---
 
-```bash
-copy .env.example .env   # Windows (cp on Linux/macOS)
-```
+## Build & run
 
-Defaults work out of the box.
-
-### 2 — Start the stack
+### Full stack (recommended)
 
 ```bash
+# 1. Environment
+copy .env.example .env          # Windows
+# cp .env.example .env          # Linux / macOS
+
+# 2. Build images and start all 6 services
 docker compose up --build
+
+# Detached (background)
+docker compose up --build -d
 ```
 
-Starts **6 services**: `mosquitto`, `postgres`, `redis`, `backend`, `bridge`,
-`frontend`. On startup the backend creates the schema, enables TimescaleDB,
-and seeds **operational data only** (users, work-order templates, rules) —
-no demo vehicles.
+On startup the backend creates the schema, enables TimescaleDB, and seeds
+operational data only (users, work-order templates, rules) — **no demo vehicles**.
 
-### 3 — Point your tracker at the bridge
+| URL | Purpose |
+|-----|---------|
+| http://localhost:5173 | Dashboard |
+| http://localhost:8000/docs | Swagger API |
+| http://localhost:8000/health | Health check |
 
-The bridge listens on port `5123` and is already published by docker-compose —
-all it needs is a public address. On a VPS with a static IP that address is
-simply **`<VPS_STATIC_IP>:5123`** (replace with your server's IP). Enter it in
-the tracker's server settings via the TCT app or Teltonika Configurator:
+### Stop / reset / logs
 
-- **FMC001**: GPRS → **Second Server** → Domain + Port, Protocol = TCP,
-  Mode = Duplicate (details in FMC001-SETUP.md, sections C + E)
-- **FMC150**: **Server Settings** → Domain + Port, Protocol = TCP
-  (details in FMC150-SETUP.md, sections C + E)
+```bash
+docker compose down              # stop (volumes kept)
+docker compose down -v           # stop and wipe all data
+docker compose ps                # service status
+docker compose logs -f bridge    # device connect, AVL decode, ACKs
+docker compose logs -f backend   # ingestion + rule engine
+docker compose restart bridge    # reload AVL maps after edit
+docker compose restart backend
+```
 
-Also tell the bridge which IMEI is which model in `.env`:
+### Hosting on a VPS
+
+1. Small VPS (1 vCPU / 2 GB) with a **static IPv4**
+2. Install Docker + Compose, copy the repo + `.env`
+3. Open inbound TCP **5123** (and `5173`/`8000` only if the UI should be public)
+4. `docker compose up --build -d`
+5. Point each tracker at `<VPS_STATIC_IP>:5123`
+
+Bench on a laptop: use the LAN IP with a router port-forward for `5123`.
+
+### Build / run services individually (dev)
+
+```bash
+# Frontend
+cd frontend
+npm install
+npm run dev          # http://localhost:5173
+npm run build        # tsc -b && vite build
+npm run preview
+
+# Backend (needs Postgres, Redis, Mosquitto from compose or local)
+cd backend
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Bridge (needs Mosquitto)
+cd bridge
+pip install -r requirements.txt
+python fmc_bridge.py
+```
+
+### Tests & checks
+
+```bash
+python -m pytest bridge/tests/ -v     # Codec 8/8E + AVL payload mapping
+python -m compileall backend/app      # backend syntax check
+cd frontend && npm run build          # TypeScript + Vite production build
+```
+
+### Key environment variables
+
+Copy from `.env.example`. Defaults work locally.
+
+| Area | Variables |
+|------|-----------|
+| DB | `POSTGRES_*`, `DATABASE_URL` |
+| Redis | `REDIS_URL` |
+| MQTT | `MQTT_HOST`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TELEMETRY_TOPIC`, `MQTT_DTC_TOPIC` |
+| Rules | `SHADOW_MODE`, `RULE_MAX_RECORD_AGE_SECONDS` (default 300) |
+| Bridge | `BRIDGE_PORT`, `BRIDGE_DEVICES`, `BRIDGE_DEFAULT_MODEL` |
+| Frontend | `VITE_API_URL`, `VITE_WS_URL` |
+
+`BRIDGE_DEVICES` maps IMEI → model (selects `avl_map.<model>.json`):
 
 ```bash
 BRIDGE_DEVICES=867648042983435:fmc001,357234561234567:fmc150
 ```
 
-#### Hosting on a VPS (static IP)
+Leave empty to accept any IMEI as `BRIDGE_DEFAULT_MODEL` (fine for first bench test).
 
-1. Provision any small VPS (1 vCPU / 2 GB RAM is enough) with a **static IPv4**.
-2. Install Docker + Compose plugin, copy this repo and your `.env` over.
-3. Open inbound TCP port **`5123`** in the firewall/security group
-   (plus `5173`/`8000` only if you want the dashboard reachable publicly).
-4. `docker compose up --build -d` — the stack is now always-on.
-5. Point each tracker at `<VPS_STATIC_IP>:5123` — configured once, no tunnel,
-   no address churn.
+---
 
-Running on a laptop for a bench test instead? Any machine reachable on its
-LAN works too — just use that machine's IP:5123 while the car is in Wi-Fi/LAN
-coverage of your router with a port-forward. A VPS is the robust always-on
-option.
+## Connect a vehicle
 
-### 4 — Register your car
+### 1. Register IMEI on the bridge
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/assets/vehicles/register ^
-  -H "Content-Type: application/json" ^
+# in .env
+BRIDGE_DEVICES=YOUR_15_DIGIT_IMEI:fmc001   # or :fmc150
+```
+
+Then `docker compose up -d` (or restart the bridge).
+
+### 2. Register the car in the API
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assets/vehicles/register \
+  -H "Content-Type: application/json" \
   -d "{\"name\": \"My Car\", \"imei\": \"YOUR_15_DIGIT_IMEI\", \"license_plate\": \"SXX1234A\", \"device_type\": \"fmc001\"}"
 ```
 
-`device_type` is `"fmc001"` (default) or `"fmc150"` — it selects which sensor
-catalog gets provisioned. This creates the vehicle **and** its
-components/sensors from the catalog
-(`backend/app/services/provisioning.py`), so the dashboard and rule engine
-know the sensor types before the first record arrives.
+`device_type` is `"fmc001"` (default) or `"fmc150"`. Registration creates the
+vehicle **and** provisions components/sensors from the catalog so the dashboard
+and rules know the sensor types before the first record arrives.
 
-### 5 — Open the app
+Unknown IMEIs are dropped by the backend on purpose.
 
-| URL | What you get |
-|---|---|
-| **http://localhost:5173** | 🖥️ Main dashboard |
-| http://localhost:8000/docs | 📖 Interactive API docs (Swagger) |
-| http://localhost:8000/health | ❤️ Health check |
+### 3. Configure the tracker
 
-Your car tile starts **GREY** and flips **GREEN** when the first real record
-arrives. Watch the pipeline live with `docker compose logs -f bridge`.
+Both devices speak **Codec 8 Extended** over TCP to `<HOST>:5123`. USB/Bluetooth
+are config-only — telemetry is LTE only. Devices are store-and-forward; the rule
+engine skips records older than `RULE_MAX_RECORD_AGE_SECONDS` so buffered trips
+never fire phantom alerts.
 
-### Stopping and resetting
+#### FMC001 (OBD-II plug-in)
+
+| What | Value |
+|------|--------|
+| Data protocol | **Codec 8 Extended** |
+| GPRS → primary server / APN | Leave alone if already on another platform |
+| GPRS → **Second Server** | Mode = **Duplicate**, Domain+Port = `<HOST>:5123`, Protocol = **TCP** |
+| Record / send period | 10s / 10s |
+| I/O to enable (priority Low) | Defaults plus OBD PIDs: 30, 31, 32, 35, 36, 37, 39, 41, 42, 48, 51, 53, 58, 60, 256, 281, 402 |
+
+Plugs into the OBD-II port — no wiring. Duplicate mode keeps the primary platform
+working; both servers must ACK before the device clears its buffer.
+
+#### FMC150 (wired CAN)
+
+| What | Value |
+|------|--------|
+| Data protocol | **Codec 8 Extended** |
+| Server Settings | Domain+Port = `<HOST>:5123`, Protocol = **TCP** |
+| Record / send period | 10s / 10s |
+| Wiring | CAN-H pin 6, CAN-L pin 14; constant +12V + ground; ignition optional |
+| CAN program | Select vehicle from Teltonika compatibility list — GPS/ignition/voltage work on every car; RPM/fuel/coolant need a supported CAN program |
+
+### 4. Verify the pipeline
 
 ```bash
-docker compose down        # stop (data preserved)
-docker compose down -v     # stop AND wipe all data
-docker compose logs -f bridge    # device connections, AVL decode, ACKs
-docker compose logs -f backend   # ingestion + rule engine
+docker compose logs -f bridge
+# expect: Device connected: IMEI ... then N record(s) published, ACK sent
 ```
 
-## Web App Pages
+Open http://localhost:5173 — vehicle tile starts **GREY**, flips **GREEN** on
+first live record. Sidebar shows **Connected** when the WebSocket is up.
 
-| Route | Page | Purpose |
-|---|---|---|
-| `/` | Dashboard | Fleet health (Green/Yellow/Red/Grey), live sensor tiles |
-| `/assets` | Assets | Vehicle → Component → Sensor hierarchy |
-| `/workorders` | Work Orders | Assign, complete, close — technician feedback loop |
-| `/alerts` | Alerts | Active/acknowledged/resolved alerts from the rule engine |
-| `/rules` | Rules | Threshold + DTC rules, templates, shadow-mode toggle |
+---
 
-## Core Modules
+## Add / register a new sensor (module)
 
-1. **Teltonika Bridge** (`bridge/`) — raw TCP listener; IMEI handshake, Codec
-   8/8E decode, CRC verify, ACK; maps AVL I/O elements → sensors via
-   `bridge/avl_map.<model>.json` (per-device-model, config-driven, no code
-   changes for new parameters); `BRIDGE_DEVICES` routes each IMEI to its model
-2. **Data Ingestion** — MQTT subscriber stores readings in TimescaleDB, caches
-   latest state in Redis, pushes WebSocket updates
-3. **Rule Engine** — threshold + DTC rules generate alerts; **freshness guard**
-   skips records older than `RULE_MAX_RECORD_AGE_SECONDS` (device buffers data
-   out-of-coverage and burst-uploads later — history never fires alerts)
-4. **Work Orders** — auto-generated from alerts; technician assign/complete
-   closes the loop into maintenance history
-5. **Dashboard** — live fleet health via WebSocket + polling
+Data path:
 
-## Teltonika Integration (FMC001 + FMC150)
+```
+Tracker I/O → bridge/avl_map.<model>.json → MQTT → mqtt_service → DB/rules/dashboard
+```
 
-Neither tracker speaks MQTT — they stream Teltonika's binary AVL protocol
-(Codec 8 Extended) over raw TCP via LTE. The `bridge` service is the adapter:
-it decodes AVL and republishes to Mosquitto using the backend's exact JSON
-contract (`teltonika/{imei}/telemetry`, `teltonika/{imei}/dtc`), so ingestion,
-rules, and the dashboard are hardware-agnostic. Because the IMEI handshake
-carries no model info, `BRIDGE_DEVICES=imei:model,...` tells the bridge which
-AVL map to apply — FMC001 (OBD-II PID IDs) or FMC150 (CAN IDs) — and both maps
-normalize into the **same sensor_type strings**, so one set of rules covers
-both trackers.
+Keep the same `sensor_type` string everywhere. FMC001 and FMC150 use **different
+AVL IDs** for the same physical quantity, but normalize to the **same**
+`sensor_type` so one rule set covers both.
 
-Full hardware onboarding — OBD plug-in / CAN wiring, server settings,
-Configurator settings, troubleshooting:
-**[FMC001-SETUP.md](FMC001-SETUP.md)** · **[FMC150-SETUP.md](FMC150-SETUP.md)**.
+### Checklist (keep these in sync)
 
-## Shadow Mode
+| # | File | Purpose |
+|---|------|---------|
+| 1 | `bridge/avl_map.fmc001.json` and/or `avl_map.fmc150.json` | AVL ID → `sensor_type` (bridge publishes MQTT) |
+| 2 | `backend/app/services/provisioning.py` | Catalog rows created on vehicle register |
+| 3 | Rules (API, UI, or `SEED_RULES` in `init_db.py`) | Optional alerts / work orders |
+| 4 | `frontend/src/utils/sensors.ts` | Optional tile icon |
 
-Enabled by default (`SHADOW_MODE=true`) — generated work orders arrive in
-*shadow* status for review. Toggle on the Rules page or:
+### Step 1 — Discover the AVL ID
+
+Enable the I/O on the tracker (Codec 8 Extended). Drive or bench-power the unit,
+then watch:
+
+```bash
+docker compose logs -f bridge
+```
+
+Unmapped IDs are logged once per process — that is your discovery tool.
+
+### Step 2 — Map in the bridge (no Python changes)
+
+Edit the model file. Example entry:
+
+```json
+{
+  "id": 1158,
+  "sensor_type": "engine_oil_pressure",
+  "name": "Engine Oil Pressure",
+  "unit": "kPa",
+  "kind": "sensor",
+  "scale": 1,
+  "offset": 0
+}
+```
+
+| `kind` | Effect |
+|--------|--------|
+| `sensor` | `payload.sensors[sensor_type] = { value, unit }` |
+| `meta` | Top-level field (`ignition`, `movement`, `vin`, …) |
+| `dtc` | Split comma-separated codes → `teltonika/{imei}/dtc` |
+
+Use `"encoding": "ascii"` for VIN / fault-code X-group fields.
+Published value = `raw * scale + offset`.
+
+```bash
+docker compose restart bridge
+```
+
+### Step 3 — Add to the provisioning catalog
+
+In `backend/app/services/provisioning.py`:
+
+- Shared Teltonika standards → `SHARED_SENSOR_CATALOG`
+- Model-specific → `FMC001_SENSOR_CATALOG` or `FMC150_SENSOR_CATALOG`
+
+Match `sensor_type` and `io_element_id` to the AVL map. Catalog changes apply to
+**newly registered** vehicles. For an existing vehicle, add a sensor via API:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assets/sensors \
+  -H "Content-Type: application/json" \
+  -d "{\"component_id\": 1, \"name\": \"Oil Pressure\", \"sensor_type\": \"engine_oil_pressure\", \"unit\": \"kPa\", \"io_element_id\": 1158}"
+```
+
+(Ingestion will store readings even without a Sensor row; the catalog/API row is
+what creates dashboard tiles and threshold coloring.)
+
+### Step 4 — Optional rule
+
+Fresh DBs get `SEED_RULES` from `backend/app/db/init_db.py`. On a running DB,
+use the Rules page or:
+
+```bash
+# list templates first
+curl -s http://localhost:8000/api/v1/rules/templates
+
+curl -X POST http://localhost:8000/api/v1/rules \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"High Oil Pressure\", \"rule_type\": \"threshold\", \"sensor_type\": \"engine_oil_pressure\", \"operator\": \">\", \"threshold_value\": 800, \"duration_seconds\": 60, \"severity\": \"warning\", \"work_order_template_id\": 1, \"is_active\": true}"
+```
+
+Sensor-row `warning_threshold` / `critical_threshold` color tiles; **alerts**
+come from `Rule` rows.
+
+### Step 5 — Optional frontend icon
+
+Add an entry in `sensorIcons` inside `frontend/src/utils/sensors.ts`
+(unknown types fall back to a default icon).
+
+### Step 6 — Enable on the device
+
+Turn on the I/O parameter in Teltonika Configurator / TCT and set priority Low
+(or higher). Take a drive and confirm the tile updates.
+
+### Register a whole new device model
+
+1. Add `bridge/avl_map.<model>.json` (auto-loaded by filename)
+2. Add `<MODEL>_SENSOR_CATALOG` and register it in `_MODEL_CATALOGS` in `provisioning.py`
+3. Extend `Literal["fmc001", "fmc150"]` in `backend/app/schemas/schemas.py`
+4. Use `BRIDGE_DEVICES=<IMEI>:<model>` and register with `"device_type": "<model>"`
+
+### MQTT contract (do not break)
+
+| Topic | Shape |
+|-------|--------|
+| `teltonika/{imei}/telemetry` | `{ timestamp, imei, ignition?, gps?, sensors: { type: { value, unit } } }` |
+| `teltonika/{imei}/dtc` | `{ timestamp, imei, dtc_code, description, severity }` |
+
+Backend wildcards (`.env`): `teltonika/+/telemetry`, `teltonika/+/dtc`.
+
+---
+
+## Sensor maps (AVL → dashboard)
+
+Same physical quantity → same `sensor_type` on both models. Full lists live in
+the JSON map files; highlights below.
+
+### Shared / standard
+
+| AVL | sensor_type | Notes |
+|-----|-------------|-------|
+| 239 | ignition (meta) | Drives GREY→GREEN |
+| 240 | movement (meta) | |
+| 21 | gsm_signal | |
+| 66 | battery_voltage | mV → V (`scale` 0.001) |
+| 67 | tracker_battery_voltage | |
+| 24 | vehicle_speed | GNSS |
+
+### FMC001 OBD highlights
+
+| AVL | sensor_type |
+|-----|-------------|
+| 36 | engine_rpm |
+| 32 | coolant_temperature |
+| 48 | fuel_level |
+| 16 | odometer |
+| 51 | control_module_voltage |
+| 281 | dtc (ASCII) |
+| 402 | distance_until_service |
+| 256 | vin (meta, ASCII) |
+
+### FMC150 CAN highlights
+
+| AVL | sensor_type |
+|-----|-------------|
+| 85 | engine_rpm |
+| 115 | coolant_temperature (×0.1) |
+| 89 | fuel_level |
+| 87 | odometer (CAN mileage; GNSS 16 unmapped on purpose) |
+| 282 | dtc (ASCII) |
+| 400 | distance_until_service |
+| 325 | vin (meta, ASCII) |
+
+---
+
+## App pages
+
+| Route | Purpose |
+|-------|---------|
+| `/` | Fleet health + live sensor tiles |
+| `/assets` | Vehicle → component → sensor hierarchy |
+| `/workorders` | Assign / complete / close |
+| `/alerts` | Rule-engine alerts |
+| `/rules` | Threshold + DTC rules, shadow-mode toggle |
+
+### Shadow mode
+
+Default `SHADOW_MODE=true` — auto work orders land in *shadow* for review.
+Toggle on the Rules page or:
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/system/shadow-mode?enabled=false"
 ```
 
-## Project Structure
+---
+
+## Project structure
 
 ```
 pdm-second/
-├── docker-compose.yml   # Full-stack orchestration (6 services)
-├── .env.example         # Environment config template
-├── FMC001-SETUP.md      # 🚗 FMC001 (OBD plug-in) → dashboard onboarding checklist
-├── FMC150-SETUP.md      # 🚗 FMC150 (wired CAN) → dashboard onboarding checklist
-├── bridge/              # Teltonika AVL (Codec 8/8E) → MQTT bridge
-│   ├── codec8e.py       #   Protocol parser (pure functions)
-│   ├── fmc_bridge.py    #   TCP server + MQTT publisher (IMEI → model routing)
-│   ├── avl_map.fmc001.json  # FMC001 OBD-II AVL ID → sensor mapping (edit this, not code)
-│   ├── avl_map.fmc150.json  # FMC150 CAN AVL ID → sensor mapping (edit this, not code)
-│   └── tests/           #   Golden-frame parser + payload tests (pytest)
-├── backend/             # FastAPI app (REST + WebSocket + MQTT ingestion)
-├── frontend/            # React + Vite + TypeScript dashboard
-└── mosquitto/           # MQTT broker config + Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── bridge/
+│   ├── codec8e.py              # Codec 8/8E parser
+│   ├── fmc_bridge.py           # TCP server + MQTT publisher
+│   ├── avl_map.fmc001.json     # FMC001 AVL → sensor map (edit this)
+│   ├── avl_map.fmc150.json     # FMC150 AVL → sensor map (edit this)
+│   └── tests/
+├── backend/
+│   └── app/
+│       ├── api/                # REST routes
+│       ├── ingestion/          # MQTT → DB / Redis / rules
+│       ├── rules/              # Threshold + DTC engine
+│       ├── services/provisioning.py
+│       └── db/init_db.py       # Schema + seed templates/rules
+├── frontend/                   # React + Vite dashboard
+└── mosquitto/                  # Broker image + config
 ```
 
-## Tests
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Device never connects | Wrong APN / SIM PIN / firewall blocking 5123 / stack down (`docker compose ps`) |
+| FMC001: primary platform also stalls | Second server unreachable — buffer waits for both ACKs; fix endpoint or disable Duplicate |
+| `REJECTED unknown IMEI` | Add `IMEI:model` to `BRIDGE_DEVICES` (or clear list) |
+| Bridge OK, empty dashboard | Vehicle not registered — backend drops unknown IMEIs |
+| Wrong values / missing RPM/fuel | Wrong model in `BRIDGE_DEVICES`, or car doesn't expose that PID/CAN param — check unmapped AVL logs |
+| No VIN / fault codes / service distance | Data protocol still plain Codec 8 — switch to **Codec 8 Extended** |
+| Alerts on an old trip | Should not happen if `RULE_MAX_RECORD_AGE_SECONDS` is set (default 300) |
+| GPS 0,0 | No sky view — window/antenna |
+
+Useful spot-checks:
 
 ```bash
-python -m pytest bridge/tests/ -v    # Codec 8/8E parser + payload mapping, both models (30 tests)
+curl -s http://localhost:8000/api/v1/dashboard/summary
+curl -s http://localhost:8000/api/v1/dashboard/fleet/live
+curl -s "http://localhost:8000/api/v1/alerts?status=active"
+curl -s http://localhost:8000/api/v1/workorders
 ```
