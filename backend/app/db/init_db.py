@@ -191,6 +191,16 @@ async def _migrate_device_type():
     logger.info("device_type migration applied (vehicles).")
 
 
+async def _migrate_sim_phone():
+    """Add vehicles.sim_phone for external SMS config notes."""
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE vehicles "
+            "ADD COLUMN IF NOT EXISTS sim_phone VARCHAR(32)"
+        ))
+    logger.info("sim_phone migration applied (vehicles).")
+
+
 async def init_database():
     """Create all tables and set up TimescaleDB hypertable."""
     # Import all models to register them with Base
@@ -219,6 +229,7 @@ async def init_database():
 
     # Add columns introduced after the first schema (existing DBs only)
     await _migrate_device_type()
+    await _migrate_sim_phone()
 
     logger.info("Database tables created successfully.")
 

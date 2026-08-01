@@ -119,50 +119,60 @@ Copy from `.env.example`. Defaults work locally.
 | Redis | `REDIS_URL` |
 | MQTT | `MQTT_HOST`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TELEMETRY_TOPIC`, `MQTT_DTC_TOPIC` |
 | Rules | `SHADOW_MODE`, `RULE_MAX_RECORD_AGE_SECONDS` (default 300) |
-| Bridge | `BRIDGE_PORT`, `BRIDGE_DEVICES`, `BRIDGE_DEFAULT_MODEL` |
-| Frontend | `VITE_API_URL`, `VITE_WS_URL` |
+| Bridge | `BRIDGE_PORT`, `BACKEND_URL`, `BRIDGE_DEVICES` (optional override), `BRIDGE_DEFAULT_MODEL` |
+| Frontend | `VITE_API_URL`, `VITE_WS_URL`, `VITE_TRACKER_SERVER` (SMS template host) |
 
-`BRIDGE_DEVICES` maps IMEI → model (selects `avl_map.<model>.json`):
+Leave `BRIDGE_DEVICES` **empty** for normal ops. The bridge polls
+`GET /api/v1/system/device-registry` (IMEI → `device_type` from registered
+vehicles) and picks `avl_map.<model>.json`. Set `BRIDGE_DEVICES` only as a
+bench allowlist/override.
 
-```bash
-BRIDGE_DEVICES=867648042983435:fmc001,357234561234567:fmc150
-```
-
-Leave empty to accept any IMEI as `BRIDGE_DEFAULT_MODEL` (fine for first bench test).
+Set `VITE_TRACKER_SERVER` to your VPS static IP (or hostname) so the Assets
+SMS helper can build a copy-paste `setparam` body. That value is **not** used
+by the TCP listener.
 
 ---
 
 ## Connect a vehicle
 
-### 1. Register IMEI on the bridge
+### 1. Register the car (Assets UI)
 
-```bash
-# in .env
-BRIDGE_DEVICES=YOUR_15_DIGIT_IMEI:fmc001   # or :fmc150
-```
+Open http://localhost:5173/assets → **Register vehicle**.
 
-Then `docker compose up -d` (or restart the bridge).
+Required: name, 15-digit IMEI, device type (`fmc001` / `fmc150`).  
+Optional: license plate, SIM phone (for SMS), VIN / make / year / fleet.
 
-### 2. Register the car in the API
+Registration provisions components/sensors from the catalog so the dashboard
+and rules know sensor types before the first record arrives. The bridge learns
+the IMEI→model map from this registration (leave `BRIDGE_DEVICES` empty).
+
+Unknown IMEIs are still dropped by the backend on purpose until registered.
+
+API fallback:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/assets/vehicles/register \
   -H "Content-Type: application/json" \
-  -d "{\"name\": \"My Car\", \"imei\": \"YOUR_15_DIGIT_IMEI\", \"license_plate\": \"SXX1234A\", \"device_type\": \"fmc001\"}"
+  -d "{\"name\": \"My Car\", \"imei\": \"YOUR_15_DIGIT_IMEI\", \"license_plate\": \"SXX1234A\", \"device_type\": \"fmc001\", \"sim_phone\": \"+60123456789\"}"
 ```
 
-`device_type` is `"fmc001"` (default) or `"fmc150"`. Registration creates the
-vehicle **and** provisions components/sensors from the catalog so the dashboard
-and rules know the sensor types before the first record arrives.
+### 2. Configure the tracker (external SMS)
 
-Unknown IMEIs are dropped by the backend on purpose.
+PREDICT does **not** send SMS. After register, use **SMS config helper** on
+Assets (or send from your phone using the SIM number you stored).
 
-### 3. Configure the tracker
+Both devices speak **Codec 8 Extended** over TCP to `<HOST>:5123`. Set
+`VITE_TRACKER_SERVER=<HOST>` in `.env` so the helper fills the template.
 
-Both devices speak **Codec 8 Extended** over TCP to `<HOST>:5123`. USB/Bluetooth
-are config-only — telemetry is LTE only. Devices are store-and-forward; the rule
-engine skips records older than `RULE_MAX_RECORD_AGE_SECONDS` so buffered trips
-never fire phantom alerts.
+Example primary-server SMS (two leading spaces if no SMS login/password):
+
+```text
+  setparam 2001:YOUR_APN;2002:;2003:;2004:<HOST>;2005:5123;2006:0
+```
+
+USB/Bluetooth Configurator works the same. Devices are store-and-forward; the
+rule engine skips records older than `RULE_MAX_RECORD_AGE_SECONDS` so buffered
+trips never fire phantom alerts.
 
 #### FMC001 (OBD-II plug-in)
 
@@ -187,7 +197,7 @@ working; both servers must ACK before the device clears its buffer.
 | Wiring | CAN-H pin 6, CAN-L pin 14; constant +12V + ground; ignition optional |
 | CAN program | Select vehicle from Teltonika compatibility list — GPS/ignition/voltage work on every car; RPM/fuel/coolant need a supported CAN program |
 
-### 4. Verify the pipeline
+### 3. Verify the pipeline
 
 ```bash
 docker compose logs -f bridge
@@ -311,7 +321,7 @@ Turn on the I/O parameter in Teltonika Configurator / TCT and set priority Low
 1. Add `bridge/avl_map.<model>.json` (auto-loaded by filename)
 2. Add `<MODEL>_SENSOR_CATALOG` and register it in `_MODEL_CATALOGS` in `provisioning.py`
 3. Extend `Literal["fmc001", "fmc150"]` in `backend/app/schemas/schemas.py`
-4. Use `BRIDGE_DEVICES=<IMEI>:<model>` and register with `"device_type": "<model>"`
+4. Register the vehicle with `"device_type": "<model>"` (bridge picks it up from device-registry)
 
 ### MQTT contract (do not break)
 
@@ -419,9 +429,9 @@ pdm-second/
 |---------|-----|
 | Device never connects | Wrong APN / SIM PIN / firewall blocking 5123 / stack down (`docker compose ps`) |
 | FMC001: primary platform also stalls | Second server unreachable — buffer waits for both ACKs; fix endpoint or disable Duplicate |
-| `REJECTED unknown IMEI` | Add `IMEI:model` to `BRIDGE_DEVICES` (or clear list) |
+| `REJECTED unknown IMEI` | `BRIDGE_DEVICES` allowlist is set and this IMEI is missing — add it or clear `BRIDGE_DEVICES` |
 | Bridge OK, empty dashboard | Vehicle not registered — backend drops unknown IMEIs |
-| Wrong values / missing RPM/fuel | Wrong model in `BRIDGE_DEVICES`, or car doesn't expose that PID/CAN param — check unmapped AVL logs |
+| Wrong values / missing RPM/fuel | Wrong `device_type` on register (or stale bridge registry), or car doesn't expose that PID/CAN param — check unmapped AVL logs |
 | No VIN / fault codes / service distance | Data protocol still plain Codec 8 — switch to **Codec 8 Extended** |
 | Alerts on an old trip | Should not happen if `RULE_MAX_RECORD_AGE_SECONDS` is set (default 300) |
 | GPS 0,0 | No sky view — window/antenna |

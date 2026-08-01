@@ -138,6 +138,7 @@ class Vehicle(TimestampMixin, Base):
     vin = Column(String(50), index=True)                # Vehicle Identification Number
     imei = Column(String(20), unique=True, index=True)  # Teltonika device IMEI (MQTT topic key)
     device_type = Column(String(20), default="fmc001", nullable=False)  # "fmc001" (OBD-II) or "fmc150" (CAN)
+    sim_phone = Column(String(32))  # SIM MSISDN for external SMS config (not used by the stack)
 
     # Health status (updated by rule engine / ingestion)
     health = Column(SAEnum(AssetHealth), default=AssetHealth.GREY, nullable=False, index=True)

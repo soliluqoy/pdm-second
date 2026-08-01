@@ -97,6 +97,23 @@ async def reset_telemetry(db: AsyncSession = Depends(get_db)):
     return {"status": "ok", **counts}
 
 
+@router.get("/device-registry", response_model=dict)
+async def device_registry(db: AsyncSession = Depends(get_db)):
+    """IMEI → device_type map for active registered vehicles.
+
+    Consumed by the Teltonika bridge so AVL map selection follows the Assets
+    register form instead of hard-coded BRIDGE_DEVICES entries.
+    """
+    result = await db.execute(
+        select(Vehicle.imei, Vehicle.device_type).where(
+            Vehicle.is_active.is_(True),
+            Vehicle.imei.isnot(None),
+            Vehicle.imei != "",
+        )
+    )
+    return {imei: (device_type or "fmc001") for imei, device_type in result.all()}
+
+
 # =============================================================================
 # Maintenance History
 # =============================================================================

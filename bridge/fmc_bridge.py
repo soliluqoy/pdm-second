@@ -9,11 +9,11 @@ the backend already consumes:
     teltonika/{imei}/telemetry  {timestamp, imei, ignition, gps{...}, sensors{...}}
     teltonika/{imei}/dtc        {timestamp, imei, dtc_code, description, severity}
 
-Multi-model support: the Teltonika handshake carries only the IMEI (no model),
-so the bridge is told which IMEI is which model via BRIDGE_DEVICES and applies
-the matching avl_map.<model>.json (FMC001 = OBD-II IDs, FMC150 = CAN IDs).
-Both maps normalize into the same sensor_type strings, so the backend, rule
-engine, and dashboard stay device-agnostic.
+Multi-model support: the Teltonika handshake carries only the IMEI (no model).
+Normal ops: leave BRIDGE_DEVICES empty and the bridge polls the backend
+device-registry (IMEI → device_type from the Assets register form), then
+applies avl_map.<model>.json. BRIDGE_DEVICES remains an optional bench
+override / allowlist. Both maps normalize into the same sensor_type strings.
 
 The backend (mqtt_service.py) consumes the JSON contract unchanged — that is
 the integration seam.
@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -59,12 +61,11 @@ BRIDGE_HOST = os.getenv("BRIDGE_HOST", "0.0.0.0")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "5123"))
 BRIDGE_IDLE_TIMEOUT = int(os.getenv("BRIDGE_IDLE_TIMEOUT", "300"))  # seconds
 
-# Device registry: comma-separated imei:model pairs, e.g.
-#   BRIDGE_DEVICES=867648042983435:fmc001,357234561234567:fmc150
-# The IMEI handshake carries no model info, so this is how the bridge picks
-# the right avl_map.<model>.json. EMPTY = accept any device as DEFAULT_MODEL
-# (handy for the first bench test; pin your real IMEI(s) afterwards).
+# Optional bench override: comma-separated imei:model pairs.
+# EMPTY (normal) = poll backend /api/v1/system/device-registry for IMEI→model.
 BRIDGE_DEFAULT_MODEL = os.getenv("BRIDGE_DEFAULT_MODEL", "fmc001").strip().lower()
+BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000").rstrip("/")
+REGISTRY_REFRESH_SECONDS = int(os.getenv("REGISTRY_REFRESH_SECONDS", "60"))
 
 
 def parse_device_registry(raw: str) -> Dict[str, str]:
@@ -82,6 +83,7 @@ def parse_device_registry(raw: str) -> Dict[str, str]:
     return devices
 
 
+# Env override / allowlist (bench). Empty → use backend registry cache.
 DEVICE_MODELS = parse_device_registry(os.getenv("BRIDGE_DEVICES", ""))
 
 # Deprecated fallback: bare IMEI allowlist (all treated as DEFAULT_MODEL).
@@ -95,8 +97,56 @@ if _legacy_raw and not DEVICE_MODELS:
         BRIDGE_DEFAULT_MODEL,
     )
 
+# Populated from GET {BACKEND_URL}/api/v1/system/device-registry
+_backend_registry: Dict[str, str] = {}
+
 TELEMETRY_TOPIC = "teltonika/{imei}/telemetry"
 DTC_TOPIC = "teltonika/{imei}/dtc"
+
+
+def resolve_model(imei: str) -> str:
+    """Env override → backend registry → BRIDGE_DEFAULT_MODEL."""
+    if imei in DEVICE_MODELS:
+        return DEVICE_MODELS[imei]
+    if imei in _backend_registry:
+        return _backend_registry[imei]
+    return BRIDGE_DEFAULT_MODEL
+
+
+def fetch_backend_registry_sync() -> Optional[Dict[str, str]]:
+    """HTTP GET device-registry. Returns dict on success, None on failure."""
+    url = f"{BACKEND_URL}/api/v1/system/device-registry"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            logger.warning("device-registry returned non-object: %s", type(data))
+            return None
+        out: Dict[str, str] = {}
+        for imei, model in data.items():
+            if not imei:
+                continue
+            out[str(imei).strip()] = str(model or BRIDGE_DEFAULT_MODEL).strip().lower()
+        return out
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        logger.warning("device-registry fetch failed (%s): %s", url, e)
+        return None
+
+
+async def registry_refresh_loop():
+    """Keep _backend_registry in sync with registered vehicles."""
+    global _backend_registry
+    while True:
+        fresh = await asyncio.to_thread(fetch_backend_registry_sync)
+        if fresh is not None and fresh != _backend_registry:
+            _backend_registry = fresh
+            summary = (
+                ", ".join(f"{k}:{v}" for k, v in sorted(fresh.items())[:8])
+                + ("…" if len(fresh) > 8 else "")
+            ) if fresh else "empty"
+            logger.info("Backend device registry: %d IMEI(s) (%s)", len(fresh), summary)
+        await asyncio.sleep(REGISTRY_REFRESH_SECONDS)
 
 
 # ── AVL I/O maps (one per device model) ───────────────────────────────────────
@@ -252,13 +302,21 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             except IncompletePacket:
                 continue
 
+        # Env BRIDGE_DEVICES acts as an exclusive allowlist when set (bench).
+        # Normal ops: leave it empty — accept any IMEI, resolve model from
+        # backend registry cache (or BRIDGE_DEFAULT_MODEL).
         if DEVICE_MODELS and imei not in DEVICE_MODELS:
             logger.warning("REJECTED unknown IMEI %s from %s", imei, peer)
             writer.write(build_imei_reply(False))
             await writer.drain()
             return
 
-        model = DEVICE_MODELS.get(imei, BRIDGE_DEFAULT_MODEL)
+        model = resolve_model(imei)
+        if imei not in DEVICE_MODELS and imei not in _backend_registry:
+            logger.info(
+                "IMEI %s not in registry — using default model %s",
+                imei, model,
+            )
         io_map = IO_MAPS.get(model)
         if io_map is None:
             logger.warning(
@@ -333,14 +391,26 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
+    global _backend_registry
     mqtt_connect_with_retry()
 
-    if not DEVICE_MODELS:
-        logger.warning(
-            "BRIDGE_DEVICES is empty — ANY device IMEI will be accepted as %s. "
-            "Set BRIDGE_DEVICES=imei:model,... once you know your IMEIs.",
-            BRIDGE_DEFAULT_MODEL,
+    if DEVICE_MODELS:
+        logger.info(
+            "BRIDGE_DEVICES override active (%d IMEI(s)) — backend registry ignored for allowlist",
+            len(DEVICE_MODELS),
         )
+    else:
+        logger.info(
+            "BRIDGE_DEVICES empty — polling %s/api/v1/system/device-registry every %ds; "
+            "unknown IMEIs use %s",
+            BACKEND_URL, REGISTRY_REFRESH_SECONDS, BRIDGE_DEFAULT_MODEL,
+        )
+        fresh = await asyncio.to_thread(fetch_backend_registry_sync)
+        if fresh is not None:
+            _backend_registry = fresh
+            logger.info("Initial device registry: %d IMEI(s)", len(fresh))
+
+    asyncio.create_task(registry_refresh_loop())
 
     server = await asyncio.start_server(handle_device, BRIDGE_HOST, BRIDGE_PORT)
     logger.info("Teltonika bridge listening on %s:%d (Codec 8/8E → MQTT %s:%d, models: %s)",

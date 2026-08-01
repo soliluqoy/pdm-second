@@ -209,7 +209,7 @@ export default function DashboardPage({ wsMessages }: Props) {
 
       {fleet.length === 0 ? (
         <>
-          <EmptyState message="No vehicles yet. Register your Teltonika-equipped car (FMC001 or FMC150) via POST /api/v1/assets/vehicles/register — see README.md." />
+          <EmptyState message="No vehicles yet. Open Assets → Register vehicle (IMEI + device type), then configure the tracker via SMS." />
           {telemetryCatalog && (
             <TelemetryCatalogPanel
               catalog={telemetryCatalog.models}

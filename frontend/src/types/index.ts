@@ -21,6 +21,8 @@ export interface Fleet {
   updated_at: string;
 }
 
+export type DeviceType = 'fmc001' | 'fmc150';
+
 export interface Vehicle {
   id: number;
   fleet_id?: number;
@@ -31,6 +33,8 @@ export interface Vehicle {
   year?: number;
   vin?: string;
   imei: string;
+  device_type?: DeviceType;
+  sim_phone?: string;
   is_active: boolean;
   health: AssetHealth;
   last_seen?: string;
@@ -40,6 +44,19 @@ export interface Vehicle {
   open_work_order_count?: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface VehicleRegisterInput {
+  name: string;
+  imei: string;
+  device_type: DeviceType;
+  license_plate?: string;
+  sim_phone?: string;
+  make?: string;
+  model?: string;
+  year?: number;
+  vin?: string;
+  fleet_id?: number;
 }
 
 export interface Component {

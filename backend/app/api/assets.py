@@ -142,7 +142,7 @@ async def _vehicle_to_out(db: AsyncSession, v: Vehicle) -> VehicleOut:
     return VehicleOut(
         id=v.id, name=v.name, license_plate=v.license_plate, make=v.make,
         model=v.model, year=v.year, vin=v.vin, imei=v.imei, device_type=v.device_type,
-        fleet_id=v.fleet_id,
+        sim_phone=v.sim_phone, fleet_id=v.fleet_id,
         is_active=v.is_active, health=v.health, last_seen=v.last_seen,
         fleet_name=fleet_name, component_count=component_count,
         active_alert_count=active_alert_count, open_work_order_count=open_wo_count,

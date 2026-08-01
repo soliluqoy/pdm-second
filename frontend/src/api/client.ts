@@ -15,6 +15,7 @@ import type {
   Vehicle,
   VehicleHealthItem,
   VehicleLiveItem,
+  VehicleRegisterInput,
   WorkOrder,
   WorkOrderTemplate,
 } from '../types';
@@ -100,6 +101,13 @@ class ApiClient {
 
   getVehicle(id: number) {
     return this.request<Vehicle>(`/assets/vehicles/${id}`);
+  }
+
+  registerVehicle(data: VehicleRegisterInput) {
+    return this.request<Vehicle>('/assets/vehicles/register', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
   }
 
   getComponents(vehicleId: number) {

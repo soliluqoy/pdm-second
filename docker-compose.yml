@@ -107,6 +107,7 @@ services:
   # ── Teltonika Bridge (AVL → MQTT) ───────────────────────────────────────────
   # Raw TCP listener for real FMC001/FMC150 devices. On a VPS, point each
   # tracker's server settings at <VPS_STATIC_IP>:5123 — no tunnel needed.
+  # Model map: polls backend /api/v1/system/device-registry (leave BRIDGE_DEVICES empty).
   bridge:
     build:
       context: ./bridge
@@ -117,11 +118,14 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+      - BACKEND_URL=${BACKEND_URL:-http://backend:8000}
     ports:
       - "5123:5123"      # Teltonika AVL TCP (Codec 8/8E)
     depends_on:
       mosquitto:
         condition: service_healthy
+      backend:
+        condition: service_started
     networks:
       - predict_net
 

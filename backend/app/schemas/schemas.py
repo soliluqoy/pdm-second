@@ -62,6 +62,7 @@ class VehicleBase(BaseModel):
     vin: Optional[str] = None
     imei: str = Field(..., max_length=20)
     device_type: Literal["fmc001", "fmc150"] = "fmc001"
+    sim_phone: Optional[str] = Field(None, max_length=32)
     fleet_id: Optional[int] = None
     is_active: bool = True
 
@@ -79,6 +80,7 @@ class VehicleUpdate(BaseModel):
     vin: Optional[str] = None
     imei: Optional[str] = None
     device_type: Optional[Literal["fmc001", "fmc150"]] = None
+    sim_phone: Optional[str] = Field(None, max_length=32)
     fleet_id: Optional[int] = None
     is_active: Optional[bool] = None
 
