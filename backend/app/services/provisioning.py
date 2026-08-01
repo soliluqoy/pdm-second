@@ -149,6 +149,88 @@ _MODEL_CATALOGS = {
     "fmc150": FMC150_SENSOR_CATALOG,
 }
 
+# ── Telemetry catalog (for dashboard preview before vehicles are registered) ───
+# GPS block is always present on every AVL record from the bridge.
+TELEMETRY_GPS_FIELDS = [
+    {"field": "latitude", "name": "Latitude", "unit": "°"},
+    {"field": "longitude", "name": "Longitude", "unit": "°"},
+    {"field": "speed", "name": "GNSS Speed", "unit": "km/h"},
+    {"field": "altitude", "name": "Altitude", "unit": "m"},
+    {"field": "angle", "name": "Heading", "unit": "°"},
+    {"field": "satellites", "name": "Satellites", "unit": ""},
+]
+
+# Meta fields mapped in bridge/avl_map.<model>.json (kind "meta" / "dtc").
+TELEMETRY_META_BY_MODEL = {
+    "fmc001": [
+        {"field": "ignition", "name": "Ignition", "io_element_id": 239,
+         "note": "Top-level flag — drives GREY→GREEN health"},
+        {"field": "movement", "name": "Movement", "io_element_id": 240, "note": "Top-level flag"},
+        {"field": "vin", "name": "VIN", "io_element_id": 256,
+         "note": "17-char ASCII, top-level payload field"},
+        {"field": "dtc", "name": "Fault codes (DTC)", "io_element_id": 281,
+         "note": "Published separately to teltonika/{imei}/dtc (one message per code)"},
+    ],
+    "fmc150": [
+        {"field": "ignition", "name": "Ignition", "io_element_id": 239,
+         "note": "Top-level flag — drives GREY→GREEN health"},
+        {"field": "movement", "name": "Movement", "io_element_id": 240, "note": "Top-level flag"},
+        {"field": "vin", "name": "VIN", "io_element_id": 325,
+         "note": "17-char ASCII, top-level payload field"},
+        {"field": "dtc", "name": "Fault codes (DTC)", "io_element_id": 282,
+         "note": "Published separately to teltonika/{imei}/dtc (one message per code)"},
+    ],
+}
+
+_DEVICE_LABELS = {
+    "fmc001": {
+        "label": "FMC001",
+        "description": "OBD-II plug-in tracker — engine PIDs depend on which PIDs your car answers.",
+    },
+    "fmc150": {
+        "label": "FMC150",
+        "description": "Wired CAN tracker — CAN parameters require Teltonika vehicle compatibility and the correct CAN program.",
+    },
+}
+
+
+def get_telemetry_catalog() -> dict:
+    """Return the full list of telemetry fields we decode and store, per device model."""
+    shared_types = {s["sensor_type"] for s in SHARED_SENSOR_CATALOG}
+    models = []
+    for device_type, model_catalog in _MODEL_CATALOGS.items():
+        info = _DEVICE_LABELS[device_type]
+        sensors = []
+        for s in SHARED_SENSOR_CATALOG + model_catalog:
+            source = "standard" if s["sensor_type"] in shared_types else (
+                "obd" if device_type == "fmc001" else "can"
+            )
+            sensors.append({
+                "sensor_type": s["sensor_type"],
+                "name": s["name"],
+                "unit": s.get("unit") or "",
+                "component": s["component"],
+                "io_element_id": s.get("io_element_id"),
+                "source": source,
+            })
+        models.append({
+            "device_type": device_type,
+            "label": info["label"],
+            "description": info["description"],
+            "sensors": sensors,
+            "meta": TELEMETRY_META_BY_MODEL[device_type],
+            "gps": TELEMETRY_GPS_FIELDS,
+        })
+    return {
+        "models": models,
+        "note": (
+            "Not every parameter arrives on every vehicle. Teltonika standard fields "
+            "(ignition, speed, voltages, GSM) work on any install; OBD/CAN engine "
+            "data depends on your car. Unmapped AVL IDs are logged by the bridge "
+            "for discovery — see bridge/avl_map.<model>.json."
+        ),
+    }
+
 
 async def provision_vehicle(db: AsyncSession, vehicle: Vehicle) -> int:
     """Attach catalog components + sensors to a freshly registered vehicle.

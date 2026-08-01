@@ -11,6 +11,7 @@ import type {
   Rule,
   Sensor,
   SensorReading,
+  TelemetryCatalog,
   Vehicle,
   VehicleHealthItem,
   VehicleLiveItem,
@@ -66,6 +67,10 @@ class ApiClient {
 
   getFleetLive() {
     return this.request<VehicleLiveItem[]>('/dashboard/fleet/live');
+  }
+
+  getTelemetryCatalog() {
+    return this.request<TelemetryCatalog>('/dashboard/telemetry-catalog');
   }
 
   getVehicleReadings(vehicleId: number, sensorType?: string, hours = 1) {

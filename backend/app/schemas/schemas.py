@@ -388,6 +388,37 @@ class VehicleLiveItem(BaseModel):
     sensors: List[LiveSensorItem] = []
 
 
+class TelemetryCatalogSensorItem(BaseModel):
+    sensor_type: str
+    name: str
+    unit: str = ""
+    component: str
+    io_element_id: Optional[int] = None
+    source: Literal["standard", "obd", "can"] = "standard"
+
+
+class TelemetryCatalogFieldItem(BaseModel):
+    field: str
+    name: str
+    unit: str = ""
+    io_element_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+class DeviceTelemetryCatalog(BaseModel):
+    device_type: str
+    label: str
+    description: str
+    sensors: List[TelemetryCatalogSensorItem]
+    meta: List[TelemetryCatalogFieldItem]
+    gps: List[TelemetryCatalogFieldItem]
+
+
+class TelemetryCatalogOut(BaseModel):
+    models: List[DeviceTelemetryCatalog]
+    note: str
+
+
 # =============================================================================
 # Maintenance History
 # =============================================================================

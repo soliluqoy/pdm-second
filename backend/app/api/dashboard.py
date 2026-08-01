@@ -30,12 +30,24 @@ from app.schemas.schemas import (
     DashboardSummary,
     LiveSensorItem,
     SensorReadingOut,
+    TelemetryCatalogOut,
     TriggerRuleInfo,
     VehicleHealthItem,
     VehicleLiveItem,
 )
+from app.services.provisioning import get_telemetry_catalog
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+@router.get("/telemetry-catalog", response_model=TelemetryCatalogOut)
+async def get_telemetry_catalog_endpoint():
+    """Parameters the stack decodes and logs, per Teltonika device model.
+
+    Useful before any vehicle is registered — shows what will appear on the
+    dashboard once a tracker connects and starts sending AVL records.
+    """
+    return get_telemetry_catalog()
 
 
 @router.get("/summary", response_model=DashboardSummary)

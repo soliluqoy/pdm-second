@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import SensorDetailDrawer from '../components/dashboard/SensorDetailDrawer';
+import TelemetryCatalogPanel from '../components/dashboard/TelemetryCatalogPanel';
 import VehicleTelemetryCard from '../components/dashboard/VehicleTelemetryCard';
 import Badge from '../components/ui/Badge';
 import PageHeader from '../components/ui/PageHeader';
@@ -13,6 +14,7 @@ import EmptyState from '../components/ui/EmptyState';
 import type {
   DashboardSummary,
   LiveSensorItem,
+  TelemetryCatalog,
   VehicleLiveItem,
   WSMessage,
 } from '../types';
@@ -37,6 +39,7 @@ const healthOrder: Record<string, number> = {
 export default function DashboardPage({ wsMessages }: Props) {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [fleet, setFleet] = useState<VehicleLiveItem[]>([]);
+  const [telemetryCatalog, setTelemetryCatalog] = useState<TelemetryCatalog | null>(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<SelectedSensor | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -46,11 +49,13 @@ export default function DashboardPage({ wsMessages }: Props) {
   const fetchData = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try {
-      const [s, f] = await Promise.all([
+      const [s, f, catalog] = await Promise.all([
         api.getDashboardSummary(),
         api.getFleetLive(),
+        api.getTelemetryCatalog(),
       ]);
       setSummary(s);
+      setTelemetryCatalog(catalog);
       setFleet(
         [...f].sort((a, b) => {
           const healthDiff = (healthOrder[a.health] ?? 99) - (healthOrder[b.health] ?? 99);
@@ -203,8 +208,15 @@ export default function DashboardPage({ wsMessages }: Props) {
       <p className="text-sm text-gray-600 mb-4">Click a sensor for history and thresholds.</p>
 
       {fleet.length === 0 ? (
-        <EmptyState message="No vehicles yet. Register your Teltonika-equipped car (FMC001 or FMC150) via POST /api/v1/assets/vehicles/register — see FMC001-SETUP.md / FMC150-SETUP.md." />
-
+        <>
+          <EmptyState message="No vehicles yet. Register your Teltonika-equipped car (FMC001 or FMC150) via POST /api/v1/assets/vehicles/register — see FMC001-SETUP.md / FMC150-SETUP.md." />
+          {telemetryCatalog && (
+            <TelemetryCatalogPanel
+              catalog={telemetryCatalog.models}
+              note={telemetryCatalog.note}
+            />
+          )}
+        </>
       ) : (
         <div className="space-y-4">
           {fleet.map((v) => (

@@ -218,6 +218,37 @@ export interface VehicleLiveItem {
   sensors: LiveSensorItem[];
 }
 
+export interface TelemetryCatalogSensorItem {
+  sensor_type: string;
+  name: string;
+  unit: string;
+  component: string;
+  io_element_id?: number;
+  source: 'standard' | 'obd' | 'can';
+}
+
+export interface TelemetryCatalogFieldItem {
+  field: string;
+  name: string;
+  unit?: string;
+  io_element_id?: number;
+  note?: string;
+}
+
+export interface DeviceTelemetryCatalog {
+  device_type: string;
+  label: string;
+  description: string;
+  sensors: TelemetryCatalogSensorItem[];
+  meta: TelemetryCatalogFieldItem[];
+  gps: TelemetryCatalogFieldItem[];
+}
+
+export interface TelemetryCatalog {
+  models: DeviceTelemetryCatalog[];
+  note: string;
+}
+
 export interface MaintenanceHistory {
   id: number;
   vehicle_id: number;
