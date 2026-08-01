@@ -12,6 +12,7 @@ from app.db.database import get_db
 from app.db.redis_client import publish_alert
 from app.db.models import Alert, AlertStatus, Vehicle
 from app.schemas.schemas import AlertOut, MessageOut
+from app.services.health import recompute_and_publish
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -39,7 +40,12 @@ async def list_alerts(
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Alert).order_by(Alert.created_at.desc())
+    # Vehicle name joined in the list query — no per-row lookups.
+    stmt = (
+        select(Alert, Vehicle.name)
+        .outerjoin(Vehicle, Vehicle.id == Alert.vehicle_id)
+        .order_by(Alert.created_at.desc())
+    )
     if status:
         stmt = stmt.where(Alert.status == status)
     if severity:
@@ -48,8 +54,16 @@ async def list_alerts(
         stmt = stmt.where(Alert.vehicle_id == vehicle_id)
     stmt = stmt.offset(skip).limit(limit)
     result = await db.execute(stmt)
-    alerts = result.scalars().all()
-    return [await _alert_to_out(db, a) for a in alerts]
+    return [
+        AlertOut(
+            id=a.id, vehicle_id=a.vehicle_id, rule_id=a.rule_id, sensor_id=a.sensor_id,
+            severity=a.severity, status=a.status, title=a.title, message=a.message,
+            trigger_value=a.trigger_value, trigger_timestamp=a.trigger_timestamp,
+            work_order_id=a.work_order_id, vehicle_name=vehicle_name,
+            created_at=a.created_at,
+        )
+        for a, vehicle_name in result.all()
+    ]
 
 
 @router.get("/{alert_id}", response_model=AlertOut)
@@ -73,6 +87,8 @@ async def acknowledge_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
     await db.flush()
     out = await _alert_to_out(db, alert)
     await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
     return out
 
 
@@ -82,10 +98,14 @@ async def resolve_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.status not in (AlertStatus.ACTIVE, AlertStatus.ACKNOWLEDGED, AlertStatus.SUPPRESSED):
+        raise HTTPException(status_code=400, detail=f"Cannot resolve alert in status '{alert.status}'")
     alert.status = AlertStatus.RESOLVED
     await db.flush()
     out = await _alert_to_out(db, alert)
     await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
     return out
 
 
@@ -95,6 +115,12 @@ async def suppress_alert(alert_id: int, db: AsyncSession = Depends(get_db)):
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.status not in (AlertStatus.ACTIVE, AlertStatus.ACKNOWLEDGED):
+        raise HTTPException(status_code=400, detail=f"Cannot suppress alert in status '{alert.status}'")
     alert.status = AlertStatus.SUPPRESSED
     await db.flush()
-    return await _alert_to_out(db, alert)
+    out = await _alert_to_out(db, alert)
+    await publish_alert(out.model_dump(mode="json"))
+    if alert.vehicle_id:
+        await recompute_and_publish(db, alert.vehicle_id)
+    return out

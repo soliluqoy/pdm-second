@@ -12,6 +12,7 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum as SAEnum,
     Float,
@@ -23,6 +24,7 @@ from sqlalchemy import (
     Index,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -86,7 +88,23 @@ class RuleType(str, enum.Enum):
     """Rule engine evaluation type."""
     THRESHOLD = "threshold"   # value > X or value < Y
     DTC = "dtc"               # diagnostic trouble code match
-    SCHEDULED = "scheduled"   # mileage / engine hours interval
+    SCHEDULED = "scheduled"   # mileage / engine hours interval (odometer, engine_hours)
+    BEHAVIOR = "behavior"     # driving-event count thresholds (harsh brake, speeding, …)
+    ANOMALY = "anomaly"       # statistical baseline deviation / domain PdM detectors
+
+
+class DrivingEventType(str, enum.Enum):
+    HARSH_ACCEL = "harsh_accel"
+    HARSH_BRAKE = "harsh_brake"
+    HARSH_CORNER = "harsh_corner"
+    SPEEDING = "speeding"
+    IDLING = "idling"
+    HIGH_RPM = "high_rpm"
+
+
+class DrivingEventSource(str, enum.Enum):
+    DEVICE = "device"
+    DERIVED = "derived"
 
 
 class UserRole(str, enum.Enum):
@@ -120,7 +138,8 @@ class Fleet(TimestampMixin, Base):
     description = Column(Text)
     is_active = Column(Boolean, default=True, nullable=False)
 
-    vehicles = relationship("Vehicle", back_populates="fleet", cascade="all, delete-orphan")
+    # Deleting a fleet detaches its vehicles (fleet_id SET NULL), never deletes them.
+    vehicles = relationship("Vehicle", back_populates="fleet", passive_deletes=True)
 
 
 class Vehicle(TimestampMixin, Base):
@@ -128,7 +147,7 @@ class Vehicle(TimestampMixin, Base):
     __tablename__ = "vehicles"
 
     id = Column(Integer, primary_key=True, index=True)
-    fleet_id = Column(Integer, ForeignKey("fleets.id"), nullable=True, index=True)
+    fleet_id = Column(Integer, ForeignKey("fleets.id", ondelete="SET NULL"), nullable=True, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Truck-001"
     license_plate = Column(String(20), index=True)
@@ -136,7 +155,9 @@ class Vehicle(TimestampMixin, Base):
     model = Column(String(50))
     year = Column(Integer)
     vin = Column(String(50), index=True)                # Vehicle Identification Number
-    imei = Column(String(20), unique=True, index=True)  # FMC150 IMEI (MQTT topic key)
+    imei = Column(String(20), unique=True, index=True)  # Teltonika device IMEI (MQTT topic key)
+    device_type = Column(String(20), default="fmc001", nullable=False)  # "fmc001" (OBD-II) or "fmc150" (CAN)
+    sim_phone = Column(String(32))  # SIM MSISDN for external SMS config (not used by the stack)
 
     # Health status (updated by rule engine / ingestion)
     health = Column(SAEnum(AssetHealth), default=AssetHealth.GREY, nullable=False, index=True)
@@ -145,10 +166,13 @@ class Vehicle(TimestampMixin, Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     fleet = relationship("Fleet", back_populates="vehicles")
-    components = relationship("Component", back_populates="vehicle", cascade="all, delete-orphan")
-    sensor_readings = relationship("SensorReading", back_populates="vehicle")
-    alerts = relationship("Alert", back_populates="vehicle")
-    work_orders = relationship("WorkOrder", back_populates="vehicle")
+    # passive_deletes: let the database CASCADE handle child rows on hard delete
+    # instead of the ORM loading and deleting them one by one.
+    components = relationship("Component", back_populates="vehicle",
+                              cascade="all, delete-orphan", passive_deletes=True)
+    sensor_readings = relationship("SensorReading", back_populates="vehicle", passive_deletes=True)
+    alerts = relationship("Alert", back_populates="vehicle", passive_deletes=True)
+    work_orders = relationship("WorkOrder", back_populates="vehicle", passive_deletes=True)
 
 
 class Component(TimestampMixin, Base):
@@ -156,7 +180,7 @@ class Component(TimestampMixin, Base):
     __tablename__ = "components"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Engine"
     component_type = Column(String(50))                 # e.g., "engine", "brake", "tire"
@@ -172,7 +196,7 @@ class Sensor(TimestampMixin, Base):
     __tablename__ = "sensors"
 
     id = Column(Integer, primary_key=True, index=True)
-    component_id = Column(Integer, ForeignKey("components.id"), nullable=False, index=True)
+    component_id = Column(Integer, ForeignKey("components.id", ondelete="CASCADE"), nullable=False, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Coolant Temperature"
     sensor_type = Column(String(50), nullable=False)    # e.g., "temperature", "rpm", "pressure"
@@ -206,8 +230,9 @@ class Rule(TimestampMixin, Base):
 
     rule_type = Column(SAEnum(RuleType), nullable=False, index=True)
 
-    # Target: can be sensor-specific or asset-type-wide
-    sensor_id = Column(Integer, ForeignKey("sensors.id"), nullable=True, index=True)
+    # Target: fleet-wide by default; optionally scoped to a single vehicle
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=True, index=True)
+    sensor_id = Column(Integer, ForeignKey("sensors.id", ondelete="SET NULL"), nullable=True, index=True)
     sensor_type = Column(String(50), nullable=True)     # e.g., apply to all "temperature" sensors
 
     # Threshold rule params
@@ -223,7 +248,7 @@ class Rule(TimestampMixin, Base):
 
     # Output
     severity = Column(SAEnum(AlertSeverity), nullable=False, default=AlertSeverity.WARNING)
-    work_order_template_id = Column(Integer, ForeignKey("work_order_templates.id"), nullable=True)
+    work_order_template_id = Column(Integer, ForeignKey("work_order_templates.id", ondelete="SET NULL"), nullable=True)
 
     is_active = Column(Boolean, default=True, nullable=False, index=True)
 
@@ -253,9 +278,9 @@ class Alert(TimestampMixin, Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    rule_id = Column(Integer, ForeignKey("rules.id"), nullable=True)
-    sensor_id = Column(Integer, ForeignKey("sensors.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey("rules.id", ondelete="SET NULL"), nullable=True)
+    sensor_id = Column(Integer, ForeignKey("sensors.id", ondelete="SET NULL"), nullable=True)
 
     severity = Column(SAEnum(AlertSeverity), nullable=False, index=True)
     status = Column(SAEnum(AlertStatus), default=AlertStatus.ACTIVE, nullable=False, index=True)
@@ -267,8 +292,14 @@ class Alert(TimestampMixin, Base):
     trigger_value = Column(Float)
     trigger_timestamp = Column(DateTime(timezone=True), default=utcnow)
 
-    # Link to generated work order (1:1 typically)
-    work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=True)
+    # Link to generated work order (1:1 typically). use_alter breaks the
+    # alerts <-> work_orders circular FK so create_all orders deterministically.
+    work_order_id = Column(
+        Integer,
+        ForeignKey("work_orders.id", ondelete="SET NULL", use_alter=True,
+                   name="fk_alerts_work_order_id"),
+        nullable=True,
+    )
 
     vehicle = relationship("Vehicle", back_populates="alerts")
 
@@ -278,9 +309,9 @@ class WorkOrder(TimestampMixin, Base):
     __tablename__ = "work_orders"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    alert_id = Column(Integer, ForeignKey("alerts.id"), nullable=True)
-    template_id = Column(Integer, ForeignKey("work_order_templates.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="SET NULL"), nullable=True)
+    template_id = Column(Integer, ForeignKey("work_order_templates.id", ondelete="SET NULL"), nullable=True)
 
     title = Column(String(200), nullable=False)
     description = Column(Text, nullable=False)
@@ -314,14 +345,48 @@ class MaintenanceHistory(Base):
     __tablename__ = "maintenance_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    work_order_id = Column(Integer, ForeignKey("work_orders.id", ondelete="SET NULL"), nullable=True)
 
     event_type = Column(String(50), nullable=False)     # "repair", "inspection", "shadow_resolved"
     title = Column(String(200), nullable=False)
     description = Column(Text)
     performed_by = Column(String(100))
+    component = Column(String(50))                      # e.g. engine, electrical — ML label
     event_date = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+
+class VehicleHealthEvent(Base):
+    """Immutable log of vehicle health transitions (for the vehicle timeline)."""
+    __tablename__ = "vehicle_health_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_health = Column(SAEnum(AssetHealth), nullable=False)
+    to_health = Column(SAEnum(AssetHealth), nullable=False)
+    reason = Column(String(100))
+    timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_vehicle_health_events_vehicle_time", "vehicle_id", "timestamp"),
+    )
+
+
+class DtcEvent(Base):
+    """Diagnostic trouble codes received from a tracker (regardless of rule match)."""
+    __tablename__ = "dtc_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    dtc_code = Column(String(20), nullable=False, index=True)
+    description = Column(Text)
+    severity = Column(String(20), default="warning")
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="SET NULL"), nullable=True)
+
+    __table_args__ = (
+        Index("ix_dtc_events_vehicle_time", "vehicle_id", "timestamp"),
+    )
 
 
 # =============================================================================
@@ -369,7 +434,7 @@ class SensorReading(Base):
     # Composite PK: timestamp (for TimescaleDB partitioning) + serial id
     timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, primary_key=True, index=True)
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
     imei = Column(String(20), index=True)               # denormalized for fast lookup
 
     sensor_type = Column(String(50), nullable=False, index=True)  # "rpm", "temperature", etc.
@@ -389,4 +454,110 @@ class SensorReading(Base):
     __table_args__ = (
         Index("ix_sensor_readings_time_vehicle", "timestamp", "vehicle_id"),
         Index("ix_sensor_readings_vehicle_sensor_time", "vehicle_id", "sensor_type", "timestamp"),
+    )
+
+
+# =============================================================================
+# Driving behavior (Phase 5)
+# =============================================================================
+
+class Trip(Base):
+    """A driving trip segmented by ignition (or movement/speed fallback)."""
+    __tablename__ = "trips"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    start_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    end_ts = Column(DateTime(timezone=True), nullable=True, index=True)
+    start_odometer = Column(Float)
+    end_odometer = Column(Float)
+    distance_km = Column(Float)
+    duration_seconds = Column(Integer)
+    max_speed = Column(Float)
+    avg_speed = Column(Float)
+    fuel_start = Column(Float)
+    fuel_end = Column(Float)
+    idle_seconds = Column(Integer, default=0, nullable=False)
+    is_open = Column(Boolean, default=True, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_trips_vehicle_start", "vehicle_id", "start_ts"),
+    )
+
+
+class DrivingEvent(Base):
+    """Harsh driving / speeding / idle / high-RPM event (device or derived)."""
+    __tablename__ = "driving_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    trip_id = Column(Integer, ForeignKey("trips.id", ondelete="SET NULL"), nullable=True, index=True)
+    ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    event_type = Column(SAEnum(DrivingEventType), nullable=False, index=True)
+    value = Column(Float)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    source = Column(SAEnum(DrivingEventSource), nullable=False, default=DrivingEventSource.DERIVED)
+
+    __table_args__ = (
+        Index("ix_driving_events_vehicle_ts", "vehicle_id", "ts"),
+        Index("ix_driving_events_vehicle_type_ts", "vehicle_id", "event_type", "ts"),
+    )
+
+
+class DriverScore(Base):
+    """Daily per-vehicle driving score (stands in for driver in single-tenant PoC)."""
+    __tablename__ = "driver_scores"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    trips = Column(Integer, default=0, nullable=False)
+    distance_km = Column(Float, default=0.0, nullable=False)
+    events_per_100km = Column(JSONB, default=dict)
+    idle_ratio = Column(Float, default=0.0, nullable=False)
+    score = Column(Float, default=100.0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("date", "vehicle_id", name="uq_driver_scores_date_vehicle"),
+    )
+
+
+# =============================================================================
+# Predictive maintenance foundation (Phase 6)
+# =============================================================================
+
+class SensorBaseline(Base):
+    """Per-vehicle, per-sensor statistical baseline from 1h aggregates."""
+    __tablename__ = "sensor_baselines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    sensor_type = Column(String(50), nullable=False, index=True)
+    window = Column(String(20), nullable=False, default="30d")  # e.g. 30d
+    mean = Column(Float, nullable=False)
+    std = Column(Float, nullable=False)
+    p95 = Column(Float)
+    sample_count = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "sensor_type", "window",
+                         name="uq_sensor_baselines_vehicle_sensor_window"),
+    )
+
+
+class ComponentRisk(Base):
+    """Placeholder for offline ML component risk scores (schema only)."""
+    __tablename__ = "component_risk"
+
+    id = Column(Integer, primary_key=True, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    component = Column(String(50), nullable=False, index=True)
+    risk_score = Column(Float, nullable=False, default=0.0)
+    model_version = Column(String(50))
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("vehicle_id", "component", name="uq_component_risk_vehicle_component"),
     )

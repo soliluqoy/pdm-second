@@ -78,19 +78,39 @@ export const statusStyles: Record<
   },
 };
 
+// Keys match the sensor_type strings from the provisioning catalog
+// (backend/app/services/provisioning.py).
 const sensorIcons: Record<string, LucideIcon> = {
   engine_rpm: Gauge,
   coolant_temperature: Thermometer,
+  engine_oil_temperature: Thermometer,
+  intake_air_temperature: Thermometer,
+  ambient_air_temperature: Thermometer,
   engine_load: Activity,
-  oil_pressure: Droplets,
-  transmission_temperature: Cog,
-  brake_pressure: Disc,
-  tire_pressure_fl: CircleDot,
+  throttle_position: Activity,
+  engine_oil_pressure: Droplets,
+  engine_oil_level: Droplets,
+  intake_map: Disc,
   battery_voltage: Zap,
+  tracker_battery_voltage: Zap,
+  control_module_voltage: Zap,
+  vehicle_battery_voltage: Zap,
+  hv_battery_charge: Zap,
   vehicle_speed: Navigation,
+  vehicle_speed_obd: Navigation,
+  gsm_signal: CircleDot,
   fuel_level: Fuel,
+  fuel_level_liters: Fuel,
+  fuel_rate: Fuel,
+  fuel_consumed: Fuel,
   odometer: Route,
+  distance_until_service: Route,
+  remaining_distance: Route,
+  mil_on_distance: Route,
+  codes_cleared_distance: Route,
   engine_hours: Clock,
+  engine_runtime: Clock,
+  dtc_count: Cog,
 };
 
 export function sensorIcon(sensorType: string): LucideIcon {

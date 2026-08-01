@@ -1,0 +1,42 @@
+# External FMC150 simulator — not part of the PREDICT product stack.
+# Set enabled: false (or stop the process) to disable the feed.
+
+enabled: true
+
+vehicle:
+  imei: "999150000000001"
+  name: "Sim FMC150"
+  license_plate: "SIM-150"
+  make: "Simulated"
+  model: "FMC150 Demo"
+  year: 2024
+  vin: "SIMFMC15000000001"
+  device_type: fmc150
+
+api:
+  base_url: "http://localhost:8000"
+
+mqtt:
+  host: localhost
+  port: 1883
+  username: predict_sim
+  password: predict_sim_pass
+  # Topics follow the bridge contract: teltonika/{imei}/telemetry|dtc
+  qos: 1
+
+publish:
+  interval_seconds: 2.0
+
+# Baseline cruise with gentle drift; spikes rotate so alerts/rules fire.
+spikes:
+  enabled: true
+  cruise_seconds: 150          # healthy period between spikes
+  spike_seconds: 40            # how long each spike lasts
+  # Rotation order (cycles forever while running)
+  profiles:
+    - overheat
+    - high_rpm
+    - low_fuel
+    - low_battery
+    - service_due
+    - dtc

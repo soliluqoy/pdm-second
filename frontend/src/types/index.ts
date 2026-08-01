@@ -8,7 +8,7 @@ export type AlertSeverity = 'critical' | 'warning' | 'info';
 export type AlertStatus = 'active' | 'acknowledged' | 'resolved' | 'suppressed';
 export type WorkOrderStatus = 'shadow' | 'open' | 'in_progress' | 'completed' | 'closed' | 'cancelled';
 export type WorkOrderPriority = 'urgent' | 'high' | 'medium' | 'low';
-export type RuleType = 'threshold' | 'dtc' | 'scheduled';
+export type RuleType = 'threshold' | 'dtc' | 'scheduled' | 'behavior' | 'anomaly';
 export type UserRole = 'admin' | 'fleet_manager' | 'technician';
 
 export interface Fleet {
@@ -21,6 +21,8 @@ export interface Fleet {
   updated_at: string;
 }
 
+export type DeviceType = 'fmc001' | 'fmc150';
+
 export interface Vehicle {
   id: number;
   fleet_id?: number;
@@ -31,6 +33,8 @@ export interface Vehicle {
   year?: number;
   vin?: string;
   imei: string;
+  device_type?: DeviceType;
+  sim_phone?: string;
   is_active: boolean;
   health: AssetHealth;
   last_seen?: string;
@@ -40,6 +44,19 @@ export interface Vehicle {
   open_work_order_count?: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface VehicleRegisterInput {
+  name: string;
+  imei: string;
+  device_type: DeviceType;
+  license_plate?: string;
+  sim_phone?: string;
+  make?: string;
+  model?: string;
+  year?: number;
+  vin?: string;
+  fleet_id?: number;
 }
 
 export interface Component {
@@ -74,6 +91,7 @@ export interface Rule {
   name: string;
   description?: string;
   rule_type: RuleType;
+  vehicle_id?: number | null;
   sensor_id?: number;
   sensor_type?: string;
   operator?: string;
@@ -84,8 +102,33 @@ export interface Rule {
   severity: AlertSeverity;
   work_order_template_id?: number;
   is_active: boolean;
+  dormant?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface RuleInput {
+  name: string;
+  description?: string;
+  rule_type: RuleType;
+  vehicle_id?: number | null;
+  sensor_type?: string;
+  operator?: string;
+  threshold_value?: number;
+  duration_seconds?: number;
+  dtc_code?: string;
+  interval_value?: number;
+  severity: AlertSeverity;
+  work_order_template_id?: number | null;
+  is_active?: boolean;
+}
+
+export interface User {
+  id: number;
+  username: string;
+  display_name: string;
+  role: UserRole;
+  is_active: boolean;
 }
 
 export interface WorkOrderTemplate {
@@ -218,6 +261,37 @@ export interface VehicleLiveItem {
   sensors: LiveSensorItem[];
 }
 
+export interface TelemetryCatalogSensorItem {
+  sensor_type: string;
+  name: string;
+  unit: string;
+  component: string;
+  io_element_id?: number;
+  source: 'standard' | 'obd' | 'can';
+}
+
+export interface TelemetryCatalogFieldItem {
+  field: string;
+  name: string;
+  unit?: string;
+  io_element_id?: number;
+  note?: string;
+}
+
+export interface DeviceTelemetryCatalog {
+  device_type: string;
+  label: string;
+  description: string;
+  sensors: TelemetryCatalogSensorItem[];
+  meta: TelemetryCatalogFieldItem[];
+  gps: TelemetryCatalogFieldItem[];
+}
+
+export interface TelemetryCatalog {
+  models: DeviceTelemetryCatalog[];
+  note: string;
+}
+
 export interface MaintenanceHistory {
   id: number;
   vehicle_id: number;
@@ -226,10 +300,99 @@ export interface MaintenanceHistory {
   title: string;
   description?: string;
   performed_by?: string;
+  component?: string;
   event_date: string;
+}
+
+export interface BehaviorScorecard {
+  vehicle_id: number;
+  vehicle_name: string;
+  license_plate?: string;
+  score?: number | null;
+  date?: string | null;
+  trips: number;
+  distance_km: number;
+  idle_ratio: number;
+  events_per_100km: Record<string, number>;
+}
+
+export interface BehaviorScorePoint {
+  date: string;
+  score: number;
+  trips: number;
+  distance_km: number;
+  idle_ratio: number;
+  events_per_100km: Record<string, number>;
+}
+
+export interface BehaviorVehicleDetail {
+  vehicle_id: number;
+  vehicle_name: string;
+  scores: BehaviorScorePoint[];
+  event_breakdown: Record<string, number>;
+}
+
+export interface Trip {
+  id: number;
+  vehicle_id: number;
+  start_ts: string;
+  end_ts?: string;
+  start_odometer?: number;
+  end_odometer?: number;
+  distance_km?: number;
+  duration_seconds?: number;
+  max_speed?: number;
+  avg_speed?: number;
+  fuel_start?: number;
+  fuel_end?: number;
+  idle_seconds: number;
+  is_open: boolean;
+}
+
+export interface DrivingEvent {
+  id: number;
+  vehicle_id: number;
+  trip_id?: number;
+  ts: string;
+  event_type: string;
+  value?: number;
+  latitude?: number;
+  longitude?: number;
+  source: string;
+}
+
+export interface TripDetail extends Trip {
+  events: DrivingEvent[];
 }
 
 export interface WSMessage {
   channel: string;
   data: any;
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+export interface HistoryPoint {
+  t: string;
+  value: number;
+  min_value?: number;
+  max_value?: number;
+  count: number;
+}
+
+export interface SensorHistory {
+  sensor_type: string;
+  resolution: 'raw' | '1m' | '1h';
+  points: HistoryPoint[];
+}
+
+export interface TimelineEvent {
+  kind: 'alert' | 'work_order' | 'maintenance' | 'health' | 'dtc' | 'driving';
+  id: number;
+  timestamp: string;
+  title: string;
+  description?: string;
+  severity?: string;
+  status?: string;
+  work_order_id?: number;
+  alert_id?: number;
 }

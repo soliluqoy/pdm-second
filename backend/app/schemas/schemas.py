@@ -1,8 +1,8 @@
 """
 PREDICT — Pydantic Schemas (API request/response models)
 """
-from datetime import datetime
-from typing import List, Optional
+from datetime import date, datetime
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -61,6 +61,8 @@ class VehicleBase(BaseModel):
     year: Optional[int] = None
     vin: Optional[str] = None
     imei: str = Field(..., max_length=20)
+    device_type: Literal["fmc001", "fmc150"] = "fmc001"
+    sim_phone: Optional[str] = Field(None, max_length=32)
     fleet_id: Optional[int] = None
     is_active: bool = True
 
@@ -77,6 +79,8 @@ class VehicleUpdate(BaseModel):
     year: Optional[int] = None
     vin: Optional[str] = None
     imei: Optional[str] = None
+    device_type: Optional[Literal["fmc001", "fmc150"]] = None
+    sim_phone: Optional[str] = Field(None, max_length=32)
     fleet_id: Optional[int] = None
     is_active: Optional[bool] = None
 
@@ -165,6 +169,7 @@ class RuleBase(BaseModel):
     name: str = Field(..., max_length=100)
     description: Optional[str] = None
     rule_type: RuleType
+    vehicle_id: Optional[int] = None    # None = fleet-wide
     sensor_id: Optional[int] = None
     sensor_type: Optional[str] = None
     operator: Optional[str] = None
@@ -185,6 +190,7 @@ class RuleUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     rule_type: Optional[RuleType] = None
+    vehicle_id: Optional[int] = None
     sensor_id: Optional[int] = None
     sensor_type: Optional[str] = None
     operator: Optional[str] = None
@@ -199,6 +205,7 @@ class RuleUpdate(BaseModel):
 
 class RuleOut(RuleBase, ORMBase):
     id: int
+    dormant: Optional[bool] = None   # active but no provisioned sensor matches
     created_at: datetime
     updated_at: datetime
 
@@ -285,12 +292,17 @@ class WorkOrderOut(ORMBase):
     is_shadow: bool
     vehicle_name: Optional[str] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 class WorkOrderComplete(BaseModel):
     """Technician completion payload."""
     completed_by: str = Field(..., max_length=100)
     completion_notes: Optional[str] = None
+    component: Optional[str] = Field(
+        None, max_length=50,
+        description="Component type label for ML (engine, electrical, …)",
+    )
 
 
 class WorkOrderAssign(BaseModel):
@@ -386,6 +398,132 @@ class VehicleLiveItem(BaseModel):
     sensors: List[LiveSensorItem] = []
 
 
+class TelemetryCatalogSensorItem(BaseModel):
+    sensor_type: str
+    name: str
+    unit: str = ""
+    component: str
+    io_element_id: Optional[int] = None
+    source: Literal["standard", "obd", "can"] = "standard"
+
+
+class TelemetryCatalogFieldItem(BaseModel):
+    field: str
+    name: str
+    unit: str = ""
+    io_element_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+class DeviceTelemetryCatalog(BaseModel):
+    device_type: str
+    label: str
+    description: str
+    sensors: List[TelemetryCatalogSensorItem]
+    meta: List[TelemetryCatalogFieldItem]
+    gps: List[TelemetryCatalogFieldItem]
+
+
+class TelemetryCatalogOut(BaseModel):
+    models: List[DeviceTelemetryCatalog]
+    note: str
+
+
+# =============================================================================
+# History (time-bucketed sensor series + merged event timeline)
+# =============================================================================
+class HistoryPoint(BaseModel):
+    """One point of a sensor series. Raw points have min == max == value."""
+    t: datetime
+    value: float
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    count: int = 1
+
+
+class SensorHistoryOut(BaseModel):
+    sensor_type: str
+    resolution: Literal["raw", "1m", "1h"]
+    points: List[HistoryPoint]
+
+
+class TimelineEvent(BaseModel):
+    """Merged vehicle event stream item."""
+    kind: Literal["alert", "work_order", "maintenance", "health", "dtc", "driving"]
+    id: int
+    timestamp: datetime
+    title: str
+    description: Optional[str] = None
+    severity: Optional[str] = None     # alerts / dtc
+    status: Optional[str] = None       # alerts + work orders + health to_health
+    work_order_id: Optional[int] = None
+    alert_id: Optional[int] = None
+
+
+# =============================================================================
+# Driving behavior
+# =============================================================================
+class BehaviorScorecard(BaseModel):
+    vehicle_id: int
+    vehicle_name: str
+    license_plate: Optional[str] = None
+    score: Optional[float] = None
+    date: Optional[date] = None
+    trips: int = 0
+    distance_km: float = 0.0
+    idle_ratio: float = 0.0
+    events_per_100km: dict = {}
+
+
+class BehaviorScorePoint(BaseModel):
+    date: date
+    score: float
+    trips: int
+    distance_km: float
+    idle_ratio: float
+    events_per_100km: dict = {}
+
+
+class BehaviorVehicleOut(BaseModel):
+    vehicle_id: int
+    vehicle_name: str
+    scores: List[BehaviorScorePoint]
+    event_breakdown: dict  # event_type → count (window)
+
+
+class DrivingEventOut(ORMBase):
+    id: int
+    vehicle_id: int
+    trip_id: Optional[int] = None
+    ts: datetime
+    event_type: str
+    value: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    source: str
+
+
+class TripOut(ORMBase):
+    id: int
+    vehicle_id: int
+    start_ts: datetime
+    end_ts: Optional[datetime] = None
+    start_odometer: Optional[float] = None
+    end_odometer: Optional[float] = None
+    distance_km: Optional[float] = None
+    duration_seconds: Optional[int] = None
+    max_speed: Optional[float] = None
+    avg_speed: Optional[float] = None
+    fuel_start: Optional[float] = None
+    fuel_end: Optional[float] = None
+    idle_seconds: int = 0
+    is_open: bool = False
+
+
+class TripDetailOut(TripOut):
+    events: List[DrivingEventOut] = []
+
+
 # =============================================================================
 # Maintenance History
 # =============================================================================
@@ -397,6 +535,7 @@ class MaintenanceHistoryOut(ORMBase):
     title: str
     description: Optional[str] = None
     performed_by: Optional[str] = None
+    component: Optional[str] = None
     event_date: datetime
 
 
@@ -428,7 +567,7 @@ class UserCreate(UserBase):
     pass
 
 
-class UserOut(ORMBase):
+class UserOut(UserBase, ORMBase):
     id: int
 
 
@@ -438,10 +577,3 @@ class UserOut(ORMBase):
 class MessageOut(BaseModel):
     message: str
     detail: Optional[str] = None
-
-
-class PaginatedOut(BaseModel):
-    items: List
-    total: int
-    skip: int
-    limit: int

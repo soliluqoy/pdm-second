@@ -1,14 +1,17 @@
 /**
  * PREDICT — Alerts Page
  */
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
-import type { Alert, WSMessage } from '../types';
 import Badge from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import FilterBar from '../components/ui/FilterBar';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { queryKeys } from '../queryClient';
+import { useWsSubscription } from '../ws/WsContext';
 
 const severityTone: Record<string, 'danger' | 'warning' | 'info'> = {
   critical: 'danger',
@@ -23,71 +26,74 @@ const statusTone: Record<string, 'danger' | 'warning' | 'success' | 'neutral'> =
   suppressed: 'neutral',
 };
 
-interface Props {
-  wsMessages: WSMessage[];
-}
+const PAGE_SIZE = 50;
 
-export default function AlertsPage({ wsMessages }: Props) {
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [loading, setLoading] = useState(true);
+export default function AlertsPage() {
+  const queryClient = useQueryClient();
   const [filterStatus, setFilterStatus] = useState('active');
   const [filterSeverity, setFilterSeverity] = useState('');
-  const lastWsIdx = useRef(0);
-  const refreshTimer = useRef<number | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const highlightId = Number(searchParams.get('highlight')) || null;
+  const highlightRef = useRef<HTMLElement | null>(null);
 
-  const fetchAlerts = useCallback(async () => {
-    try {
-      const params: { status?: string; severity?: string } = {};
-      if (filterStatus) params.status = filterStatus;
-      if (filterSeverity) params.severity = filterSeverity;
-      const a = await api.getAlerts(params);
-      setAlerts(a);
-    } catch (e) {
-      console.error('Failed to fetch alerts:', e);
-    } finally {
-      setLoading(false);
-    }
-  }, [filterStatus, filterSeverity]);
+  const filters = useMemo(
+    () => ({
+      status: filterStatus || undefined,
+      severity: filterSeverity || undefined,
+    }),
+    [filterStatus, filterSeverity]
+  );
 
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current) window.clearTimeout(refreshTimer.current);
-    refreshTimer.current = window.setTimeout(() => fetchAlerts(), 1000);
-  }, [fetchAlerts]);
+  const alertsQuery = useInfiniteQuery({
+    queryKey: queryKeys.alerts(filters),
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) =>
+      api.getAlerts({
+        ...filters,
+        skip: pageParam,
+        limit: PAGE_SIZE,
+      }),
+    getNextPageParam: (lastPage, allPages) =>
+      lastPage.length === PAGE_SIZE ? allPages.reduce((n, p) => n + p.length, 0) : undefined,
+    refetchInterval: 15_000,
+  });
+
+  const alerts = useMemo(
+    () => alertsQuery.data?.pages.flat() ?? [],
+    [alertsQuery.data]
+  );
+
+  useWsSubscription(['ws:alerts'], () => {
+    void queryClient.invalidateQueries({ queryKey: ['alerts'] });
+  });
 
   useEffect(() => {
-    fetchAlerts();
-    const interval = setInterval(fetchAlerts, 10_000);
-    return () => clearInterval(interval);
-  }, [fetchAlerts]);
-
-  useEffect(() => {
-    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
-      if (wsMessages[i].channel === 'ws:alerts') {
-        scheduleRefresh();
-      }
+    if (!highlightId || alertsQuery.isLoading) return;
+    const present = alerts.some((a) => a.id === highlightId);
+    if (!present && filterStatus !== '') {
+      setFilterStatus('');
+      return;
     }
-    lastWsIdx.current = wsMessages.length;
-  }, [wsMessages, scheduleRefresh]);
+    const el = highlightRef.current;
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const t = setTimeout(() => setSearchParams({}, { replace: true }), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [highlightId, alerts, alertsQuery.isLoading, filterStatus, setSearchParams]);
 
-  const handleAcknowledge = async (id: number) => {
+  const handleAction = async (action: 'ack' | 'resolve' | 'suppress', id: number) => {
     try {
-      await api.acknowledgeAlert(id);
-      fetchAlerts();
+      if (action === 'ack') await api.acknowledgeAlert(id);
+      else if (action === 'resolve') await api.resolveAlert(id);
+      else await api.suppressAlert(id);
+      void queryClient.invalidateQueries({ queryKey: ['alerts'] });
     } catch (e) {
-      console.error('Failed to acknowledge:', e);
+      console.error(`Failed to ${action}:`, e);
     }
   };
 
-  const handleResolve = async (id: number) => {
-    try {
-      await api.resolveAlert(id);
-      fetchAlerts();
-    } catch (e) {
-      console.error('Failed to resolve:', e);
-    }
-  };
-
-  if (loading) {
+  if (alertsQuery.isLoading) {
     return <LoadingState message="Loading alerts…" />;
   }
 
@@ -109,6 +115,7 @@ export default function AlertsPage({ wsMessages }: Props) {
               { value: 'active', label: 'Active' },
               { value: 'acknowledged', label: 'Acknowledged' },
               { value: 'resolved', label: 'Resolved' },
+              { value: 'suppressed', label: 'Suppressed' },
               { value: '', label: 'All' },
             ],
           },
@@ -132,7 +139,13 @@ export default function AlertsPage({ wsMessages }: Props) {
       ) : (
         <div className="space-y-3">
           {alerts.map((a) => (
-            <article key={a.id} className="panel p-4">
+            <article
+              key={a.id}
+              ref={a.id === highlightId ? (el) => { highlightRef.current = el; } : undefined}
+              className={`panel p-4 transition-shadow ${
+                a.id === highlightId ? 'ring-2 ring-predict-400 shadow-md' : ''
+              }`}
+            >
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2 mb-2">
@@ -168,15 +181,24 @@ export default function AlertsPage({ wsMessages }: Props) {
                 <div className="flex flex-wrap gap-2 shrink-0">
                   {a.status === 'active' && (
                     <button
-                      onClick={() => handleAcknowledge(a.id)}
+                      onClick={() => handleAction('ack', a.id)}
                       className="btn-warning"
                     >
                       Acknowledge
                     </button>
                   )}
+                  {(a.status === 'active' || a.status === 'acknowledged') && (
+                    <button
+                      onClick={() => handleAction('suppress', a.id)}
+                      className="btn-secondary"
+                      title="Mute this alert without resolving it"
+                    >
+                      Suppress
+                    </button>
+                  )}
                   {a.status !== 'resolved' && (
                     <button
-                      onClick={() => handleResolve(a.id)}
+                      onClick={() => handleAction('resolve', a.id)}
                       className="btn-success"
                     >
                       Resolve
@@ -186,6 +208,18 @@ export default function AlertsPage({ wsMessages }: Props) {
               </div>
             </article>
           ))}
+
+          {alertsQuery.hasNextPage && (
+            <div className="text-center pt-2">
+              <button
+                onClick={() => void alertsQuery.fetchNextPage()}
+                disabled={alertsQuery.isFetchingNextPage}
+                className="btn-secondary"
+              >
+                {alertsQuery.isFetchingNextPage ? 'Loading…' : 'Load more'}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

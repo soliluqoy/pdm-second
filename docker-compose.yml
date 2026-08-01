@@ -1,15 +1,18 @@
 # =============================================================================
 # PREDICT — Predictive Maintenance CMSS
-# Docker Compose stack (local PoC)
+# Docker Compose stack (REAL Teltonika hardware — FMC001 + FMC150, no simulator)
 # =============================================================================
 # Services:
 #   mosquitto  - MQTT broker (sensor data transport)
 #   postgres   - PostgreSQL 16 + TimescaleDB (relational + time-series)
 #   redis      - Redis 7 (latest state, alert queue, websocket pubsub)
 #   backend    - FastAPI (REST + WebSocket + MQTT ingestion)
-#   simulator  - FMC150 telematics emulator (publishes synthetic data)
+#   bridge     - Teltonika AVL (Codec 8/8E) TCP listener → MQTT
 #   frontend   - React + Vite dashboard
+#
+# Device path:  FMC001/FMC150 → 4G LTE → <VPS_STATIC_IP>:5123 → bridge → mosquitto → backend
 # =============================================================================
+
 
 services:
   # ── MQTT Broker ─────────────────────────────────────────────────────────────
@@ -101,22 +104,31 @@ services:
     networks:
       - predict_net
 
-  # ── FMC150 Simulator ────────────────────────────────────────────────────────
-  simulator:
+  # ── Teltonika Bridge (AVL → MQTT) ───────────────────────────────────────────
+  # Raw TCP listener for real FMC001/FMC150 devices. On a VPS, point each
+  # tracker's server settings at <VPS_STATIC_IP>:5123 — no tunnel needed.
+  # Model map: polls backend /api/v1/system/device-registry (leave BRIDGE_DEVICES empty).
+  bridge:
     build:
-      context: ./simulator
+      context: ./bridge
       dockerfile: Dockerfile
-    container_name: predict_simulator
+    container_name: predict_bridge
     restart: unless-stopped
     env_file:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+      - BACKEND_URL=${BACKEND_URL:-http://backend:8000}
+    ports:
+      - "5123:5123"      # Teltonika AVL TCP (Codec 8/8E)
     depends_on:
       mosquitto:
         condition: service_healthy
+      backend:
+        condition: service_started
     networks:
       - predict_net
+
 
   # ── Frontend (React + Vite) ─────────────────────────────────────────────────
   frontend:
