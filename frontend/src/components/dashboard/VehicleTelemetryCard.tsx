@@ -1,16 +1,18 @@
 /**
  * PREDICT — VehicleTelemetryCard
- * Vehicle summary + sensor grid.
+ * Vehicle summary + sensor grid. Memoized: only re-renders when its own
+ * vehicle data changes, with a local clock for the staleness indicator.
  */
-import { formatDistanceToNow } from 'date-fns';
+import { memo, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { LiveSensorItem, VehicleLiveItem } from '../../types';
 import Badge from '../ui/Badge';
+import RelativeTime from '../ui/RelativeTime';
 import SensorTile from './SensorTile';
 
 interface Props {
   vehicle: VehicleLiveItem;
-  now: number;
-  onSelectSensor: (sensor: LiveSensorItem) => void;
+  onSelectSensor: (vehicleId: number, sensor: LiveSensorItem) => void;
 }
 
 const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
@@ -20,9 +22,15 @@ const healthTone: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> =
   grey: 'neutral',
 };
 
-export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: Props) {
+function VehicleTelemetryCardInner({ vehicle, onSelectSensor }: Props) {
   const ts = vehicle.telemetry_timestamp ?? vehicle.last_seen;
-  const lastUpdate = ts ? formatDistanceToNow(new Date(ts), { addSuffix: true }) : 'never';
+
+  // Local 15s clock for the stale indicator — doesn't tick the page.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(t);
+  }, []);
   const stale = ts ? now - new Date(ts).getTime() > 300_000 : true;
 
   return (
@@ -31,7 +39,12 @@ export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: P
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2 flex-wrap">
-              <h3 className="text-base font-semibold text-gray-900">{vehicle.name}</h3>
+              <Link
+                to={`/vehicles/${vehicle.id}`}
+                className="text-base font-semibold text-gray-900 hover:text-predict-700 hover:underline"
+              >
+                {vehicle.name}
+              </Link>
               <Badge tone={healthTone[vehicle.health] ?? 'neutral'}>{vehicle.health}</Badge>
             </div>
             <p className="text-sm text-gray-600 mt-0.5">
@@ -41,7 +54,10 @@ export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: P
 
           <div className="text-sm text-gray-600 space-y-1 text-right">
             <p>
-              Ignition: <span className="font-medium text-gray-900">{vehicle.ignition ? 'On' : 'Off'}</span>
+              Ignition:{' '}
+              <span className="font-medium text-gray-900">
+                {vehicle.ignition == null ? '—' : vehicle.ignition ? 'On' : 'Off'}
+              </span>
               {' · '}
               Speed: <span className="font-medium text-gray-900 tabular-nums">
                 {vehicle.speed != null ? `${Math.round(vehicle.speed)} km/h` : '—'}
@@ -49,9 +65,11 @@ export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: P
             </p>
             <p className="tabular-nums">
               {stale ? (
-                <span className="text-gray-500">Last update {lastUpdate}</span>
+                <RelativeTime timestamp={ts} prefix="Last update" className="text-gray-500" />
               ) : (
-                <span className="text-green-700">Live · updated {lastUpdate}</span>
+                <span className="text-green-700">
+                  Live · <RelativeTime timestamp={ts} prefix="updated" />
+                </span>
               )}
               {vehicle.active_alert_count > 0 && (
                 <span className="ml-3 text-red-700">{vehicle.active_alert_count} alert(s)</span>
@@ -74,7 +92,7 @@ export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: P
             <SensorTile
               key={s.sensor_type}
               sensor={s}
-              onClick={() => onSelectSensor(s)}
+              onClick={() => onSelectSensor(vehicle.id, s)}
             />
           ))
         )}
@@ -82,3 +100,6 @@ export default function VehicleTelemetryCard({ vehicle, now, onSelectSensor }: P
     </div>
   );
 }
+
+const VehicleTelemetryCard = memo(VehicleTelemetryCardInner);
+export default VehicleTelemetryCard;

@@ -63,6 +63,18 @@ class Settings(BaseSettings):
     # (no sensor values, ignition, or speed shown).
     TELEMETRY_LIVE_MAX_AGE_SECONDS: int = 300
 
+    # Offline watchdog: vehicles with no telemetry for this long (and no active
+    # alerts) revert to GREY health. Checked every WATCHDOG_INTERVAL_SECONDS.
+    OFFLINE_AFTER_SECONDS: int = 300
+    WATCHDOG_INTERVAL_SECONDS: int = 60
+
+    # Raw sensor_readings older than this are dropped by the Timescale
+    # retention policy (1m/1h continuous aggregates are kept).
+    READINGS_RETENTION_DAYS: int = 365
+
+    # Rule engine: in-process rule cache TTL (invalidated on rules CRUD too).
+    RULES_CACHE_TTL_SECONDS: int = 30
+
 
     @field_validator("CORS_ORIGINS")
     @classmethod

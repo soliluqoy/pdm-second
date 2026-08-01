@@ -8,18 +8,33 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from fastapi import Query
+
 from app.db.database import get_db
-from app.db.models import MaintenanceHistory, SystemConfig, Vehicle
+from app.db.models import MaintenanceHistory, SystemConfig, User, Vehicle
 from app.schemas.schemas import (
     MaintenanceHistoryOut,
     MessageOut,
     SystemConfigOut,
     SystemConfigUpdate,
+    UserOut,
 )
+from app.services.settings_service import get_shadow_mode as read_shadow_mode
+from app.services.settings_service import invalidate_shadow_mode_cache
 from app.services.telemetry_reset import reset_telemetry_data
 
 router = APIRouter(prefix="/system", tags=["system"])
+
+
+# =============================================================================
+# Users (simple picker — single tenant, no auth)
+# =============================================================================
+@router.get("/users", response_model=List[UserOut])
+async def list_users(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(User).where(User.is_active == True).order_by(User.id)  # noqa: E712
+    )
+    return result.scalars().all()
 
 
 # =============================================================================
@@ -53,15 +68,8 @@ async def update_config(key: str, data: SystemConfigUpdate, db: AsyncSession = D
 
 @router.get("/shadow-mode", response_model=dict)
 async def get_shadow_mode(db: AsyncSession = Depends(get_db)):
-    """Get current shadow mode status."""
-    # Check DB config first, fall back to env setting
-    result = await db.execute(
-        select(SystemConfig).where(SystemConfig.key == "shadow_mode")
-    )
-    cfg = result.scalar_one_or_none()
-    if cfg:
-        return {"shadow_mode": cfg.value.lower() == "true"}
-    return {"shadow_mode": settings.SHADOW_MODE}
+    """Get current shadow mode status (system_config is the source of truth)."""
+    return {"shadow_mode": await read_shadow_mode(db)}
 
 
 @router.post("/shadow-mode", response_model=dict)
@@ -81,8 +89,7 @@ async def set_shadow_mode(enabled: bool, db: AsyncSession = Depends(get_db)):
         )
         db.add(cfg)
     await db.flush()
-    # Update runtime setting
-    settings.SHADOW_MODE = enabled
+    invalidate_shadow_mode_cache()
     return {"shadow_mode": enabled}
 
 
@@ -120,21 +127,30 @@ async def device_registry(db: AsyncSession = Depends(get_db)):
 @router.get("/history", response_model=List[MaintenanceHistoryOut])
 async def list_maintenance_history(
     vehicle_id: Optional[int] = None,
-    limit: int = 100,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(MaintenanceHistory).order_by(MaintenanceHistory.event_date.desc()).limit(limit)
+    stmt = select(MaintenanceHistory).order_by(MaintenanceHistory.event_date.desc())
     if vehicle_id is not None:
         stmt = stmt.where(MaintenanceHistory.vehicle_id == vehicle_id)
+    stmt = stmt.offset(skip).limit(limit)
     result = await db.execute(stmt)
     return result.scalars().all()
 
 
 @router.get("/history/vehicle/{vehicle_id}", response_model=List[MaintenanceHistoryOut])
-async def get_vehicle_history(vehicle_id: int, db: AsyncSession = Depends(get_db)):
+async def get_vehicle_history(
+    vehicle_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(MaintenanceHistory)
         .where(MaintenanceHistory.vehicle_id == vehicle_id)
         .order_by(MaintenanceHistory.event_date.desc())
+        .offset(skip)
+        .limit(limit)
     )
     return result.scalars().all()

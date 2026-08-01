@@ -1,11 +1,18 @@
 """
 PREDICT — Rule Engine
-Evaluates threshold and DTC rules against incoming telemetry.
+Evaluates threshold, DTC, and scheduled rules against incoming telemetry.
 Creates alerts + work orders, recomputes vehicle health, broadcasts via Redis pub/sub.
+
+Performance notes:
+- Active rules are cached in-process (TTL + explicit invalidation from the
+  rules CRUD API) so the ingestion hot path doesn't re-query them per message.
+- The caller (MQTT ingestion) passes its DB session and the vehicle row so no
+  extra session/queries are opened per telemetry record.
 """
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from sqlalchemy import select
 
@@ -13,11 +20,9 @@ from app.config import settings
 from app.db.database import async_session_factory
 from app.db.models import (
     Alert,
-    AlertSeverity,
     AlertStatus,
     Rule,
     RuleType,
-    SystemConfig,
     Vehicle,
     WorkOrder,
     WorkOrderStatus,
@@ -30,18 +35,60 @@ from app.db.redis_client import (
     redis_client,
 )
 from app.services.health import recompute_health
+from app.services.settings_service import get_shadow_mode
 
 logger = logging.getLogger("predict.rules")
+
+# Tolerance for float equality rules — exact == is useless on telemetry floats.
+EQUALITY_EPSILON = 1e-6
 
 OPERATORS = {
     ">": lambda v, t: v > t,
     "<": lambda v, t: v < t,
     ">=": lambda v, t: v >= t,
     "<=": lambda v, t: v <= t,
-    "==": lambda v, t: v == t,
+    "==": lambda v, t: abs(v - t) <= EQUALITY_EPSILON,
 }
 
+# Sensor types a SCHEDULED rule can track (monotonically increasing counters).
+SCHEDULED_SENSOR_TYPES = ("odometer", "engine_hours")
 
+
+# ── In-process rule cache ─────────────────────────────────────────────────────
+class _RuleCache:
+    """Cached active rules, refreshed on TTL expiry or explicit invalidation."""
+
+    def __init__(self):
+        self._rules: List[Rule] = []
+        self._loaded_at: float = 0.0
+        self._dirty = True
+
+    def invalidate(self) -> None:
+        self._dirty = True
+
+    async def get(self, session) -> List[Rule]:
+        now = time.monotonic()
+        if self._dirty or (now - self._loaded_at) > settings.RULES_CACHE_TTL_SECONDS:
+            result = await session.execute(
+                select(Rule).where(Rule.is_active == True)  # noqa: E712
+            )
+            # Detached read-only use is safe: expire_on_commit=False and no
+            # lazy relationships are accessed during evaluation.
+            self._rules = list(result.scalars().all())
+            self._loaded_at = now
+            self._dirty = False
+        return self._rules
+
+
+_rule_cache = _RuleCache()
+
+
+def invalidate_rules_cache() -> None:
+    """Called by the rules CRUD API after create/update/delete."""
+    _rule_cache.invalidate()
+
+
+# ── Value helpers ─────────────────────────────────────────────────────────────
 def _extract_value(sensor_data: Any) -> Optional[float]:
     if sensor_data is None:
         return None
@@ -64,18 +111,15 @@ def _condition_met(value: float, operator: str, threshold: float) -> bool:
     return fn(value, threshold)
 
 
-async def _get_shadow_mode(session) -> bool:
-    result = await session.execute(
-        select(SystemConfig).where(SystemConfig.key == "shadow_mode")
-    )
-    cfg = result.scalar_one_or_none()
-    if cfg:
-        return cfg.value.lower() == "true"
-    return settings.SHADOW_MODE
-
-
+# ── Sustained-duration tracking (Redis) ───────────────────────────────────────
 def _duration_key(rule_id: int, vehicle_id: int) -> str:
     return f"rule:{rule_id}:vehicle:{vehicle_id}:since"
+
+
+def _duration_ttl(duration_seconds: int) -> int:
+    """Keys self-expire so a vehicle that stops reporting doesn't leak keys,
+    and a very old 'since' can't satisfy a freshly resumed condition."""
+    return max(duration_seconds * 3, 900)
 
 
 async def _check_duration(rule_id: int, vehicle_id: int, ts: datetime, duration_seconds: int) -> bool:
@@ -83,10 +127,13 @@ async def _check_duration(rule_id: int, vehicle_id: int, ts: datetime, duration_
     if duration_seconds <= 0:
         return True
     key = _duration_key(rule_id, vehicle_id)
+    ttl = _duration_ttl(duration_seconds)
     since_str = await redis_client.get(key)
     if since_str is None:
-        await redis_client.set(key, ts.isoformat())
+        await redis_client.set(key, ts.isoformat(), ex=ttl)
         return False
+    # Refresh expiry while the condition holds
+    await redis_client.expire(key, ttl)
     since = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
@@ -98,6 +145,7 @@ async def _reset_duration(rule_id: int, vehicle_id: int) -> None:
     await redis_client.delete(_duration_key(rule_id, vehicle_id))
 
 
+# ── Alert dedupe ──────────────────────────────────────────────────────────────
 async def _has_open_alert(session, vehicle_id: int, rule_id: int) -> bool:
     result = await session.execute(
         select(Alert.id).where(
@@ -109,6 +157,7 @@ async def _has_open_alert(session, vehicle_id: int, rule_id: int) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+# ── Alert + work order creation ───────────────────────────────────────────────
 async def _create_alert_and_work_order(
     session,
     *,
@@ -120,7 +169,7 @@ async def _create_alert_and_work_order(
     ts: datetime,
     vehicle_name: str,
 ) -> None:
-    shadow_mode = await _get_shadow_mode(session)
+    shadow_mode = await get_shadow_mode(session)
 
     alert = Alert(
         vehicle_id=vehicle_id,
@@ -197,107 +246,206 @@ async def _create_alert_and_work_order(
     )
 
 
+def _rule_applies_to_vehicle(rule: Rule, vehicle_id: int) -> bool:
+    return rule.vehicle_id is None or rule.vehicle_id == vehicle_id
+
+
+# ── Threshold evaluation ──────────────────────────────────────────────────────
 async def evaluate_telemetry(
     vehicle_id: int,
     imei: str,
     sensors: dict,
     ts: datetime,
+    session=None,
+    vehicle_name: Optional[str] = None,
 ) -> None:
-    """Evaluate all active threshold rules against incoming sensor readings."""
-    async with async_session_factory() as session:
-        vresult = await session.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
-        vehicle = vresult.scalar_one_or_none()
-        if not vehicle:
-            return
-        vehicle_name = vehicle.name
+    """Evaluate active threshold + scheduled rules against incoming readings.
 
-        rules_result = await session.execute(
-            select(Rule).where(Rule.is_active == True, Rule.rule_type == RuleType.THRESHOLD)
+    The ingestion service passes its session and the vehicle name; standalone
+    callers (tests, scripts) can omit them.
+    """
+    if session is not None:
+        await _evaluate_telemetry(session, vehicle_id, sensors, ts, vehicle_name)
+        return
+    async with async_session_factory() as own_session:
+        await _evaluate_telemetry(own_session, vehicle_id, sensors, ts, vehicle_name)
+
+
+async def _evaluate_telemetry(session, vehicle_id: int, sensors: dict, ts: datetime,
+                              vehicle_name: Optional[str]) -> None:
+    if vehicle_name is None:
+        vresult = await session.execute(
+            select(Vehicle.name).where(Vehicle.id == vehicle_id)
         )
-        rules = rules_result.scalars().all()
+        vehicle_name = vresult.scalar_one_or_none()
+        if vehicle_name is None:
+            return
 
-        for rule in rules:
-            if not rule.sensor_type or rule.threshold_value is None or not rule.operator:
-                continue
+    rules = await _rule_cache.get(session)
 
-            raw = sensors.get(rule.sensor_type)
-            value = _extract_value(raw)
-            if value is None:
-                await _reset_duration(rule.id, vehicle_id)
-                continue
-
-            if not _condition_met(value, rule.operator, rule.threshold_value):
-                await _reset_duration(rule.id, vehicle_id)
-                continue
-
-            if not await _check_duration(rule.id, vehicle_id, ts, rule.duration_seconds or 0):
-                continue
-
-            if await _has_open_alert(session, vehicle_id, rule.id):
-                continue
-
-            title = rule.name
-            message = (
-                f"{rule.description or rule.name}: "
-                f"{rule.sensor_type}={value} (threshold {rule.operator} {rule.threshold_value})"
-            )
-            await _create_alert_and_work_order(
-                session,
-                vehicle_id=vehicle_id,
-                rule=rule,
-                title=title,
-                message=message,
-                trigger_value=value,
-                ts=ts,
-                vehicle_name=vehicle_name,
-            )
-            await _reset_duration(rule.id, vehicle_id)
+    for rule in rules:
+        if not _rule_applies_to_vehicle(rule, vehicle_id):
+            continue
+        if rule.rule_type == RuleType.THRESHOLD:
+            await _evaluate_threshold_rule(session, rule, vehicle_id, vehicle_name, sensors, ts)
+        elif rule.rule_type == RuleType.SCHEDULED:
+            await _evaluate_scheduled_rule(session, rule, vehicle_id, vehicle_name, sensors, ts)
 
 
+async def _evaluate_threshold_rule(session, rule: Rule, vehicle_id: int,
+                                   vehicle_name: str, sensors: dict, ts: datetime) -> None:
+    if not rule.sensor_type or rule.threshold_value is None or not rule.operator:
+        return
+
+    if rule.sensor_type not in sensors:
+        # AVL records legitimately omit IO elements. Absence is "no
+        # information": keep any running duration window (it self-expires via
+        # TTL) instead of resetting it — otherwise sparse records make
+        # sustained conditions unfireable.
+        return
+
+    value = _extract_value(sensors.get(rule.sensor_type))
+    if value is None:
+        return
+
+    if not _condition_met(value, rule.operator, rule.threshold_value):
+        await _reset_duration(rule.id, vehicle_id)
+        return
+
+    if not await _check_duration(rule.id, vehicle_id, ts, rule.duration_seconds or 0):
+        return
+
+    if await _has_open_alert(session, vehicle_id, rule.id):
+        return
+
+    title = rule.name
+    message = (
+        f"{rule.description or rule.name}: "
+        f"{rule.sensor_type}={value} (threshold {rule.operator} {rule.threshold_value})"
+    )
+    await _create_alert_and_work_order(
+        session,
+        vehicle_id=vehicle_id,
+        rule=rule,
+        title=title,
+        message=message,
+        trigger_value=value,
+        ts=ts,
+        vehicle_name=vehicle_name,
+    )
+    await _reset_duration(rule.id, vehicle_id)
+
+
+# ── Scheduled (interval) evaluation ───────────────────────────────────────────
+def _scheduled_key(rule_id: int, vehicle_id: int) -> str:
+    return f"rule:{rule_id}:vehicle:{vehicle_id}:next_due"
+
+
+async def _evaluate_scheduled_rule(session, rule: Rule, vehicle_id: int,
+                                   vehicle_name: str, sensors: dict, ts: datetime) -> None:
+    """Interval maintenance on a monotonically increasing counter.
+
+    sensor_type must be 'odometer' or 'engine_hours' and interval_value the
+    service interval in that unit. First sighting anchors next_due at
+    current + interval; each crossing fires once and re-anchors.
+    """
+    if (not rule.interval_value or rule.interval_value <= 0
+            or rule.sensor_type not in SCHEDULED_SENSOR_TYPES):
+        return
+
+    value = _extract_value(sensors.get(rule.sensor_type))
+    if value is None:
+        return
+
+    key = _scheduled_key(rule.id, vehicle_id)
+    next_due_raw = await redis_client.get(key)
+    if next_due_raw is None:
+        await redis_client.set(key, str(value + rule.interval_value))
+        return
+
+    try:
+        next_due = float(next_due_raw)
+    except (TypeError, ValueError):
+        await redis_client.set(key, str(value + rule.interval_value))
+        return
+
+    if value < next_due:
+        return
+
+    if not await _has_open_alert(session, vehicle_id, rule.id):
+        unit = "km" if rule.sensor_type == "odometer" else "h"
+        title = rule.name
+        message = (
+            f"{rule.description or rule.name}: {rule.sensor_type} reached "
+            f"{value:.0f}{unit} (interval {rule.interval_value:.0f}{unit})"
+        )
+        await _create_alert_and_work_order(
+            session,
+            vehicle_id=vehicle_id,
+            rule=rule,
+            title=title,
+            message=message,
+            trigger_value=value,
+            ts=ts,
+            vehicle_name=vehicle_name,
+        )
+    # Re-anchor whether or not a duplicate alert was suppressed.
+    await redis_client.set(key, str(value + rule.interval_value))
+
+
+# ── DTC evaluation ────────────────────────────────────────────────────────────
 async def evaluate_dtc(
     vehicle_id: int,
     imei: str,
     dtc_code: str,
     description: str,
     severity: str,
+    session=None,
+    vehicle_name: Optional[str] = None,
 ) -> None:
     """Evaluate DTC rules against an incoming diagnostic trouble code."""
     if not dtc_code:
         return
+    if session is not None:
+        await _evaluate_dtc(session, vehicle_id, dtc_code, description, vehicle_name)
+        return
+    async with async_session_factory() as own_session:
+        await _evaluate_dtc(own_session, vehicle_id, dtc_code, description, vehicle_name)
 
-    async with async_session_factory() as session:
-        vresult = await session.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
-        vehicle = vresult.scalar_one_or_none()
-        if not vehicle:
-            return
-        vehicle_name = vehicle.name
 
-        rules_result = await session.execute(
-            select(Rule).where(
-                Rule.is_active == True,
-                Rule.rule_type == RuleType.DTC,
-                Rule.dtc_code == dtc_code,
-            )
+async def _evaluate_dtc(session, vehicle_id: int, dtc_code: str,
+                        description: str, vehicle_name: Optional[str]) -> None:
+    if vehicle_name is None:
+        vresult = await session.execute(
+            select(Vehicle.name).where(Vehicle.id == vehicle_id)
         )
-        rules = rules_result.scalars().all()
-        if not rules:
-            logger.debug("No DTC rule for code %s (vehicle %s)", dtc_code, vehicle_name)
+        vehicle_name = vresult.scalar_one_or_none()
+        if vehicle_name is None:
             return
 
-        ts = datetime.now(timezone.utc)
-        for rule in rules:
-            if await _has_open_alert(session, vehicle_id, rule.id):
-                continue
+    rules = [
+        r for r in await _rule_cache.get(session)
+        if r.rule_type == RuleType.DTC and r.dtc_code == dtc_code
+        and _rule_applies_to_vehicle(r, vehicle_id)
+    ]
+    if not rules:
+        logger.debug("No DTC rule for code %s (vehicle %s)", dtc_code, vehicle_name)
+        return
 
-            title = rule.name
-            message = f"{description or rule.description} (DTC: {dtc_code})"
-            await _create_alert_and_work_order(
-                session,
-                vehicle_id=vehicle_id,
-                rule=rule,
-                title=title,
-                message=message,
-                trigger_value=None,
-                ts=ts,
-                vehicle_name=vehicle_name,
-            )
+    ts = datetime.now(timezone.utc)
+    for rule in rules:
+        if await _has_open_alert(session, vehicle_id, rule.id):
+            continue
+
+        title = rule.name
+        message = f"{description or rule.description} (DTC: {dtc_code})"
+        await _create_alert_and_work_order(
+            session,
+            vehicle_id=vehicle_id,
+            rule=rule,
+            title=title,
+            message=message,
+            trigger_value=None,
+            ts=ts,
+            vehicle_name=vehicle_name,
+        )

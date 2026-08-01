@@ -86,7 +86,7 @@ class RuleType(str, enum.Enum):
     """Rule engine evaluation type."""
     THRESHOLD = "threshold"   # value > X or value < Y
     DTC = "dtc"               # diagnostic trouble code match
-    SCHEDULED = "scheduled"   # mileage / engine hours interval
+    SCHEDULED = "scheduled"   # mileage / engine hours interval (odometer, engine_hours)
 
 
 class UserRole(str, enum.Enum):
@@ -120,7 +120,8 @@ class Fleet(TimestampMixin, Base):
     description = Column(Text)
     is_active = Column(Boolean, default=True, nullable=False)
 
-    vehicles = relationship("Vehicle", back_populates="fleet", cascade="all, delete-orphan")
+    # Deleting a fleet detaches its vehicles (fleet_id SET NULL), never deletes them.
+    vehicles = relationship("Vehicle", back_populates="fleet", passive_deletes=True)
 
 
 class Vehicle(TimestampMixin, Base):
@@ -128,7 +129,7 @@ class Vehicle(TimestampMixin, Base):
     __tablename__ = "vehicles"
 
     id = Column(Integer, primary_key=True, index=True)
-    fleet_id = Column(Integer, ForeignKey("fleets.id"), nullable=True, index=True)
+    fleet_id = Column(Integer, ForeignKey("fleets.id", ondelete="SET NULL"), nullable=True, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Truck-001"
     license_plate = Column(String(20), index=True)
@@ -147,10 +148,13 @@ class Vehicle(TimestampMixin, Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     fleet = relationship("Fleet", back_populates="vehicles")
-    components = relationship("Component", back_populates="vehicle", cascade="all, delete-orphan")
-    sensor_readings = relationship("SensorReading", back_populates="vehicle")
-    alerts = relationship("Alert", back_populates="vehicle")
-    work_orders = relationship("WorkOrder", back_populates="vehicle")
+    # passive_deletes: let the database CASCADE handle child rows on hard delete
+    # instead of the ORM loading and deleting them one by one.
+    components = relationship("Component", back_populates="vehicle",
+                              cascade="all, delete-orphan", passive_deletes=True)
+    sensor_readings = relationship("SensorReading", back_populates="vehicle", passive_deletes=True)
+    alerts = relationship("Alert", back_populates="vehicle", passive_deletes=True)
+    work_orders = relationship("WorkOrder", back_populates="vehicle", passive_deletes=True)
 
 
 class Component(TimestampMixin, Base):
@@ -158,7 +162,7 @@ class Component(TimestampMixin, Base):
     __tablename__ = "components"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Engine"
     component_type = Column(String(50))                 # e.g., "engine", "brake", "tire"
@@ -174,7 +178,7 @@ class Sensor(TimestampMixin, Base):
     __tablename__ = "sensors"
 
     id = Column(Integer, primary_key=True, index=True)
-    component_id = Column(Integer, ForeignKey("components.id"), nullable=False, index=True)
+    component_id = Column(Integer, ForeignKey("components.id", ondelete="CASCADE"), nullable=False, index=True)
 
     name = Column(String(100), nullable=False)          # e.g., "Coolant Temperature"
     sensor_type = Column(String(50), nullable=False)    # e.g., "temperature", "rpm", "pressure"
@@ -208,8 +212,9 @@ class Rule(TimestampMixin, Base):
 
     rule_type = Column(SAEnum(RuleType), nullable=False, index=True)
 
-    # Target: can be sensor-specific or asset-type-wide
-    sensor_id = Column(Integer, ForeignKey("sensors.id"), nullable=True, index=True)
+    # Target: fleet-wide by default; optionally scoped to a single vehicle
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=True, index=True)
+    sensor_id = Column(Integer, ForeignKey("sensors.id", ondelete="SET NULL"), nullable=True, index=True)
     sensor_type = Column(String(50), nullable=True)     # e.g., apply to all "temperature" sensors
 
     # Threshold rule params
@@ -225,7 +230,7 @@ class Rule(TimestampMixin, Base):
 
     # Output
     severity = Column(SAEnum(AlertSeverity), nullable=False, default=AlertSeverity.WARNING)
-    work_order_template_id = Column(Integer, ForeignKey("work_order_templates.id"), nullable=True)
+    work_order_template_id = Column(Integer, ForeignKey("work_order_templates.id", ondelete="SET NULL"), nullable=True)
 
     is_active = Column(Boolean, default=True, nullable=False, index=True)
 
@@ -255,9 +260,9 @@ class Alert(TimestampMixin, Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    rule_id = Column(Integer, ForeignKey("rules.id"), nullable=True)
-    sensor_id = Column(Integer, ForeignKey("sensors.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey("rules.id", ondelete="SET NULL"), nullable=True)
+    sensor_id = Column(Integer, ForeignKey("sensors.id", ondelete="SET NULL"), nullable=True)
 
     severity = Column(SAEnum(AlertSeverity), nullable=False, index=True)
     status = Column(SAEnum(AlertStatus), default=AlertStatus.ACTIVE, nullable=False, index=True)
@@ -269,8 +274,14 @@ class Alert(TimestampMixin, Base):
     trigger_value = Column(Float)
     trigger_timestamp = Column(DateTime(timezone=True), default=utcnow)
 
-    # Link to generated work order (1:1 typically)
-    work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=True)
+    # Link to generated work order (1:1 typically). use_alter breaks the
+    # alerts <-> work_orders circular FK so create_all orders deterministically.
+    work_order_id = Column(
+        Integer,
+        ForeignKey("work_orders.id", ondelete="SET NULL", use_alter=True,
+                   name="fk_alerts_work_order_id"),
+        nullable=True,
+    )
 
     vehicle = relationship("Vehicle", back_populates="alerts")
 
@@ -280,9 +291,9 @@ class WorkOrder(TimestampMixin, Base):
     __tablename__ = "work_orders"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    alert_id = Column(Integer, ForeignKey("alerts.id"), nullable=True)
-    template_id = Column(Integer, ForeignKey("work_order_templates.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id", ondelete="SET NULL"), nullable=True)
+    template_id = Column(Integer, ForeignKey("work_order_templates.id", ondelete="SET NULL"), nullable=True)
 
     title = Column(String(200), nullable=False)
     description = Column(Text, nullable=False)
@@ -316,8 +327,8 @@ class MaintenanceHistory(Base):
     __tablename__ = "maintenance_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
-    work_order_id = Column(Integer, ForeignKey("work_orders.id"), nullable=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    work_order_id = Column(Integer, ForeignKey("work_orders.id", ondelete="SET NULL"), nullable=True)
 
     event_type = Column(String(50), nullable=False)     # "repair", "inspection", "shadow_resolved"
     title = Column(String(200), nullable=False)
@@ -371,7 +382,7 @@ class SensorReading(Base):
     # Composite PK: timestamp (for TimescaleDB partitioning) + serial id
     timestamp = Column(DateTime(timezone=True), default=utcnow, nullable=False, primary_key=True, index=True)
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
     imei = Column(String(20), index=True)               # denormalized for fast lookup
 
     sensor_type = Column(String(50), nullable=False, index=True)  # "rpm", "temperature", etc.

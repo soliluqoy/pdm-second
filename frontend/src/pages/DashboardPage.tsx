@@ -1,8 +1,10 @@
 /**
  * PREDICT — Dashboard Page
  * Fleet summary + live sensor telemetry grid.
+ * Data flow: initial REST load + WebSocket patches; 30s REST reconciliation.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Search } from 'lucide-react';
 import { api } from '../api/client';
 import SensorDetailDrawer from '../components/dashboard/SensorDetailDrawer';
 import TelemetryCatalogPanel from '../components/dashboard/TelemetryCatalogPanel';
@@ -11,18 +13,14 @@ import Badge from '../components/ui/Badge';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import EmptyState from '../components/ui/EmptyState';
+import { useWsSubscription } from '../ws/WsContext';
 import type {
   DashboardSummary,
   LiveSensorItem,
   TelemetryCatalog,
   VehicleLiveItem,
-  WSMessage,
 } from '../types';
 import { computeSensorStatus } from '../utils/sensors';
-
-interface Props {
-  wsMessages: WSMessage[];
-}
 
 interface SelectedSensor {
   vehicleId: number;
@@ -36,33 +34,52 @@ const healthOrder: Record<string, number> = {
   grey: 3,
 };
 
-export default function DashboardPage({ wsMessages }: Props) {
+const healthFilters = ['all', 'red', 'yellow', 'green', 'grey'] as const;
+
+function sortFleet(list: VehicleLiveItem[]): VehicleLiveItem[] {
+  return [...list].sort((a, b) => {
+    const healthDiff = (healthOrder[a.health] ?? 99) - (healthOrder[b.health] ?? 99);
+    if (healthDiff !== 0) return healthDiff;
+    return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
+  });
+}
+
+/** "N of M live" badge with its own clock so the page doesn't tick. */
+function LiveCountBadge({ fleet }: { fleet: VehicleLiveItem[] }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+  const online = fleet.filter(
+    (v) => v.telemetry_timestamp && now - new Date(v.telemetry_timestamp).getTime() <= 30_000
+  ).length;
+  return (
+    <Badge tone={online > 0 ? 'success' : 'neutral'}>
+      {online} of {fleet.length} live
+    </Badge>
+  );
+}
+
+export default function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [fleet, setFleet] = useState<VehicleLiveItem[]>([]);
   const [telemetryCatalog, setTelemetryCatalog] = useState<TelemetryCatalog | null>(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<SelectedSensor | null>(null);
-  const [now, setNow] = useState(Date.now());
-  const lastWsIdx = useRef(0);
+  const [search, setSearch] = useState('');
+  const [healthFilter, setHealthFilter] = useState<string>('all');
   const refreshTimer = useRef<number | null>(null);
 
   const fetchData = useCallback(async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try {
-      const [s, f, catalog] = await Promise.all([
+      const [s, f] = await Promise.all([
         api.getDashboardSummary(),
         api.getFleetLive(),
-        api.getTelemetryCatalog(),
       ]);
       setSummary(s);
-      setTelemetryCatalog(catalog);
-      setFleet(
-        [...f].sort((a, b) => {
-          const healthDiff = (healthOrder[a.health] ?? 99) - (healthOrder[b.health] ?? 99);
-          if (healthDiff !== 0) return healthDiff;
-          return (b.active_alert_count ?? 0) - (a.active_alert_count ?? 0);
-        })
-      );
+      setFleet(sortFleet(f));
     } catch (e) {
       console.error('Failed to fetch dashboard data:', e);
     } finally {
@@ -72,13 +89,14 @@ export default function DashboardPage({ wsMessages }: Props) {
 
   useEffect(() => {
     fetchData(true);
-    const interval = setInterval(() => fetchData(), 15000);
+    // Reconciliation poll: WS is the primary update path.
+    const interval = setInterval(() => fetchData(), 30_000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
+  // The telemetry catalog is static — fetch it once.
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    api.getTelemetryCatalog().then(setTelemetryCatalog).catch(console.error);
   }, []);
 
   const scheduleRefresh = useCallback(() => {
@@ -116,9 +134,9 @@ export default function DashboardPage({ wsMessages }: Props) {
     );
   }, []);
 
-  useEffect(() => {
-    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
-      const msg = wsMessages[i];
+  useWsSubscription(
+    ['ws:telemetry', 'ws:health', 'ws:alerts', 'ws:workorders'],
+    (msg) => {
       if (msg.channel === 'ws:telemetry') {
         patchTelemetry(msg.data);
       } else if (msg.channel === 'ws:health') {
@@ -126,16 +144,28 @@ export default function DashboardPage({ wsMessages }: Props) {
         const health = msg.data?.health;
         if (vehicleId && health) {
           setFleet((prev) =>
-            prev.map((v) => (v.id === vehicleId ? { ...v, health } : v))
+            sortFleet(prev.map((v) => (v.id === vehicleId ? { ...v, health } : v)))
           );
         }
         scheduleRefresh();
-      } else if (msg.channel === 'ws:alerts' || msg.channel === 'ws:workorders') {
+      } else {
         scheduleRefresh();
       }
     }
-    lastWsIdx.current = wsMessages.length;
-  }, [wsMessages, patchTelemetry, scheduleRefresh]);
+  );
+
+  const visibleFleet = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return fleet.filter((v) => {
+      if (healthFilter !== 'all' && v.health !== healthFilter) return false;
+      if (!q) return true;
+      return (
+        v.name.toLowerCase().includes(q) ||
+        (v.license_plate ?? '').toLowerCase().includes(q) ||
+        v.imei.includes(q)
+      );
+    });
+  }, [fleet, search, healthFilter]);
 
   const selectedVehicle = selected
     ? fleet.find((v) => v.id === selected.vehicleId)
@@ -144,9 +174,11 @@ export default function DashboardPage({ wsMessages }: Props) {
     (s) => s.sensor_type === selected?.sensorType
   );
 
-  const onlineCount = fleet.filter(
-    (v) => v.telemetry_timestamp && now - new Date(v.telemetry_timestamp).getTime() <= 30_000
-  ).length;
+  const handleSelectSensor = useCallback(
+    (vehicleId: number, sensor: LiveSensorItem) =>
+      setSelected({ vehicleId, sensorType: sensor.sensor_type }),
+    []
+  );
 
   if (loading) {
     return (
@@ -168,9 +200,7 @@ export default function DashboardPage({ wsMessages }: Props) {
         description="Fleet health, alerts, and live sensor readings"
         actions={
           <>
-            <Badge tone={onlineCount > 0 ? 'success' : 'neutral'}>
-              {onlineCount} of {fleet.length} live
-            </Badge>
+            <LiveCountBadge fleet={fleet} />
             {summary?.shadow_mode && <Badge tone="purple">Shadow mode on</Badge>}
           </>
         }
@@ -183,7 +213,7 @@ export default function DashboardPage({ wsMessages }: Props) {
           detail={
             <span>
               {summary?.green_count ?? 0} healthy · {summary?.yellow_count ?? 0} warning ·{' '}
-              {summary?.red_count ?? 0} critical · {summary?.grey_count ?? 0} unknown
+              {summary?.red_count ?? 0} critical · {summary?.grey_count ?? 0} offline
             </span>
           }
         />
@@ -204,8 +234,39 @@ export default function DashboardPage({ wsMessages }: Props) {
         />
       </div>
 
-      <h2 className="section-title">Live telemetry</h2>
-      <p className="text-sm text-gray-600 mb-4">Click a sensor for history and thresholds.</p>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div>
+          <h2 className="section-title mb-0">Live telemetry</h2>
+          <p className="text-sm text-gray-600">Click a sensor for history and thresholds.</p>
+        </div>
+        {fleet.length > 1 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Name, plate, IMEI…"
+                className="filter-select pl-8 w-48"
+              />
+            </div>
+            {healthFilters.map((h) => (
+              <button
+                key={h}
+                type="button"
+                onClick={() => setHealthFilter(h)}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium capitalize border ${
+                  healthFilter === h
+                    ? 'bg-predict-50 border-predict-300 text-predict-700'
+                    : 'bg-white border-gray-200 text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                {h}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
 
       {fleet.length === 0 ? (
         <>
@@ -217,14 +278,15 @@ export default function DashboardPage({ wsMessages }: Props) {
             />
           )}
         </>
+      ) : visibleFleet.length === 0 ? (
+        <EmptyState message="No vehicles match your filter." />
       ) : (
         <div className="space-y-4">
-          {fleet.map((v) => (
+          {visibleFleet.map((v) => (
             <VehicleTelemetryCard
               key={v.id}
               vehicle={v}
-              now={now}
-              onSelectSensor={(s) => setSelected({ vehicleId: v.id, sensorType: s.sensor_type })}
+              onSelectSensor={handleSelectSensor}
             />
           ))}
         </div>

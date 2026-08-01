@@ -1,12 +1,14 @@
 """
 PREDICT — Dashboard API
-Fleet health summary, vehicle health list, and time-series sensor data.
+Fleet health summary, vehicle health list, live telemetry, time-series sensor
+history (raw + Timescale continuous aggregates), and the merged vehicle
+event timeline.
 """
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -17,6 +19,7 @@ from app.db.models import (
     AlertStatus,
     AssetHealth,
     Component,
+    MaintenanceHistory,
     Rule,
     RuleType,
     Sensor,
@@ -28,14 +31,18 @@ from app.db.models import (
 from app.db.redis_client import get_all_vehicle_states
 from app.schemas.schemas import (
     DashboardSummary,
+    HistoryPoint,
     LiveSensorItem,
+    SensorHistoryOut,
     SensorReadingOut,
     TelemetryCatalogOut,
+    TimelineEvent,
     TriggerRuleInfo,
     VehicleHealthItem,
     VehicleLiveItem,
 )
 from app.services.provisioning import get_telemetry_catalog
+from app.services.settings_service import get_shadow_mode
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -52,113 +59,100 @@ async def get_telemetry_catalog_endpoint():
 
 @router.get("/summary", response_model=DashboardSummary)
 async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
-    """High-level fleet health summary for the dashboard header."""
-    # Vehicle counts by health
-    total = await db.execute(select(func.count(Vehicle.id)).where(Vehicle.is_active == True))
-    total_vehicles = total.scalar() or 0
+    """High-level fleet health summary — three grouped queries, not ten."""
+    vrow = (await db.execute(
+        select(
+            func.count(Vehicle.id),
+            func.count(Vehicle.id).filter(Vehicle.health == AssetHealth.GREEN),
+            func.count(Vehicle.id).filter(Vehicle.health == AssetHealth.YELLOW),
+            func.count(Vehicle.id).filter(Vehicle.health == AssetHealth.RED),
+            func.count(Vehicle.id).filter(Vehicle.health == AssetHealth.GREY),
+        ).where(Vehicle.is_active == True)  # noqa: E712
+    )).one()
 
-    green = await db.execute(
-        select(func.count(Vehicle.id)).where(
-            Vehicle.is_active == True, Vehicle.health == AssetHealth.GREEN
+    arow = (await db.execute(
+        select(
+            func.count(Alert.id).filter(Alert.status == AlertStatus.ACTIVE),
+            func.count(Alert.id).filter(
+                Alert.status == AlertStatus.ACTIVE,
+                Alert.severity == AlertSeverity.CRITICAL,
+            ),
         )
-    )
-    yellow = await db.execute(
-        select(func.count(Vehicle.id)).where(
-            Vehicle.is_active == True, Vehicle.health == AssetHealth.YELLOW
-        )
-    )
-    red = await db.execute(
-        select(func.count(Vehicle.id)).where(
-            Vehicle.is_active == True, Vehicle.health == AssetHealth.RED
-        )
-    )
-    grey = await db.execute(
-        select(func.count(Vehicle.id)).where(
-            Vehicle.is_active == True, Vehicle.health == AssetHealth.GREY
-        )
-    )
+    )).one()
 
-    # Alert counts
-    active_alerts = await db.execute(
-        select(func.count(Alert.id)).where(Alert.status == AlertStatus.ACTIVE)
-    )
-    critical_alerts = await db.execute(
-        select(func.count(Alert.id)).where(
-            Alert.status == AlertStatus.ACTIVE, Alert.severity == AlertSeverity.CRITICAL
+    wrow = (await db.execute(
+        select(
+            func.count(WorkOrder.id).filter(WorkOrder.status == WorkOrderStatus.OPEN),
+            func.count(WorkOrder.id).filter(WorkOrder.status == WorkOrderStatus.SHADOW),
+            func.count(WorkOrder.id).filter(WorkOrder.status == WorkOrderStatus.IN_PROGRESS),
         )
-    )
-
-    # Work order counts
-    open_wos = await db.execute(
-        select(func.count(WorkOrder.id)).where(WorkOrder.status == WorkOrderStatus.OPEN)
-    )
-    shadow_wos = await db.execute(
-        select(func.count(WorkOrder.id)).where(WorkOrder.status == WorkOrderStatus.SHADOW)
-    )
-    in_progress_wos = await db.execute(
-        select(func.count(WorkOrder.id)).where(WorkOrder.status == WorkOrderStatus.IN_PROGRESS)
-    )
+    )).one()
 
     return DashboardSummary(
-        total_vehicles=total_vehicles,
-        green_count=green.scalar() or 0,
-        yellow_count=yellow.scalar() or 0,
-        red_count=red.scalar() or 0,
-        grey_count=grey.scalar() or 0,
-        active_alerts=active_alerts.scalar() or 0,
-        critical_alerts=critical_alerts.scalar() or 0,
-        open_work_orders=open_wos.scalar() or 0,
-        shadow_work_orders=shadow_wos.scalar() or 0,
-        in_progress_work_orders=in_progress_wos.scalar() or 0,
-        shadow_mode=settings.SHADOW_MODE,
+        total_vehicles=vrow[0] or 0,
+        green_count=vrow[1] or 0,
+        yellow_count=vrow[2] or 0,
+        red_count=vrow[3] or 0,
+        grey_count=vrow[4] or 0,
+        active_alerts=arow[0] or 0,
+        critical_alerts=arow[1] or 0,
+        open_work_orders=wrow[0] or 0,
+        shadow_work_orders=wrow[1] or 0,
+        in_progress_work_orders=wrow[2] or 0,
+        shadow_mode=await get_shadow_mode(db),
     )
+
+
+def _grouped_counts(rows) -> dict:
+    return {vehicle_id: count for vehicle_id, count in rows}
+
+
+async def _alert_wo_counts(db: AsyncSession, vehicle_ids: List[int]):
+    """Active-alert and open-WO counts per vehicle in two grouped queries."""
+    if not vehicle_ids:
+        return {}, {}
+    alert_counts = _grouped_counts((await db.execute(
+        select(Alert.vehicle_id, func.count())
+        .where(Alert.vehicle_id.in_(vehicle_ids), Alert.status == AlertStatus.ACTIVE)
+        .group_by(Alert.vehicle_id)
+    )).all())
+    wo_counts = _grouped_counts((await db.execute(
+        select(WorkOrder.vehicle_id, func.count())
+        .where(
+            WorkOrder.vehicle_id.in_(vehicle_ids),
+            WorkOrder.status.in_([
+                WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS, WorkOrderStatus.SHADOW
+            ]),
+        )
+        .group_by(WorkOrder.vehicle_id)
+    )).all())
+    return alert_counts, wo_counts
 
 
 @router.get("/health", response_model=List[VehicleHealthItem])
 async def get_fleet_health(db: AsyncSession = Depends(get_db)):
     """Fleet health overview — all vehicles with health status and counts.
     Sorted: red first, then yellow, then grey, then green."""
-    vehicles = await db.execute(
-        select(Vehicle).where(Vehicle.is_active == True).order_by(Vehicle.id)
-    )
-    vehicles = vehicles.scalars().all()
+    vehicles = (await db.execute(
+        select(Vehicle).where(Vehicle.is_active == True).order_by(Vehicle.id)  # noqa: E712
+    )).scalars().all()
+    vehicle_ids = [v.id for v in vehicles]
 
-    # Get all latest states from Redis
     states = await get_all_vehicle_states()
+    alert_counts, wo_counts = await _alert_wo_counts(db, vehicle_ids)
 
-    # Health sort order
     health_order = {AssetHealth.RED: 0, AssetHealth.YELLOW: 1, AssetHealth.GREY: 2, AssetHealth.GREEN: 3}
 
-    items = []
-    for v in vehicles:
-        # Active alert count
-        ac = await db.execute(
-            select(func.count(Alert.id)).where(
-                Alert.vehicle_id == v.id, Alert.status == AlertStatus.ACTIVE
-            )
-        )
-        active_alert_count = ac.scalar() or 0
-
-        # Open work order count
-        wc = await db.execute(
-            select(func.count(WorkOrder.id)).where(
-                WorkOrder.vehicle_id == v.id,
-                WorkOrder.status.in_([
-                    WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS, WorkOrderStatus.SHADOW
-                ]),
-            )
-        )
-        open_wo_count = wc.scalar() or 0
-
-        items.append(VehicleHealthItem(
+    items = [
+        VehicleHealthItem(
             id=v.id, name=v.name, imei=v.imei, health=v.health,
             last_seen=v.last_seen, license_plate=v.license_plate,
-            active_alert_count=active_alert_count,
-            open_work_order_count=open_wo_count,
-            latest_readings=states.get(v.id),
-        ))
-
-    # Sort by health priority
+            active_alert_count=alert_counts.get(v.id, 0),
+            open_work_order_count=wo_counts.get(v.id, 0),
+            latest_readings=(states.get(v.id) or {}).get("sensors"),
+        )
+        for v in vehicles
+    ]
     items.sort(key=lambda x: health_order.get(x.health, 99))
     return items
 
@@ -176,9 +170,8 @@ def _parse_state_timestamp(ts_raw) -> Optional[datetime]:
         return None
 
 
-def _is_state_live(state: dict) -> bool:
-    """True when Redis snapshot is fresh enough to show as live telemetry."""
-    ts = _parse_state_timestamp(state.get("timestamp"))
+def _is_fresh(ts_raw) -> bool:
+    ts = _parse_state_timestamp(ts_raw)
     if ts is None:
         return False
     age = (datetime.now(timezone.utc) - ts).total_seconds()
@@ -225,9 +218,11 @@ def _sensor_status(value: Optional[float], sensor: Sensor, direction: str) -> st
 async def get_fleet_live(db: AsyncSession = Depends(get_db)):
     """Full live telemetry for every active vehicle: all sensors with their
     latest values (Redis cache), operating thresholds, active trigger rules,
-    and computed per-sensor status. One request — no N+1 on the frontend."""
+    and computed per-sensor status. Freshness is judged PER SENSOR (merged
+    Redis state carries a timestamp per reading), so a partial AVL record
+    doesn't blank out sensors it didn't carry."""
     vehicles = (await db.execute(
-        select(Vehicle).where(Vehicle.is_active == True).order_by(Vehicle.id)
+        select(Vehicle).where(Vehicle.is_active == True).order_by(Vehicle.id)  # noqa: E712
     )).scalars().all()
     if not vehicles:
         return []
@@ -244,7 +239,7 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
     if comp_ids:
         sensors = (await db.execute(
             select(Sensor)
-            .where(Sensor.component_id.in_(comp_ids), Sensor.is_active == True)
+            .where(Sensor.component_id.in_(comp_ids), Sensor.is_active == True)  # noqa: E712
             .order_by(Sensor.id)
         )).scalars().all()
     sensors_by_vehicle: dict = {}
@@ -253,7 +248,7 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
 
     # Active threshold rules, grouped by sensor_type
     rules = (await db.execute(
-        select(Rule).where(Rule.is_active == True, Rule.rule_type == RuleType.THRESHOLD)
+        select(Rule).where(Rule.is_active == True, Rule.rule_type == RuleType.THRESHOLD)  # noqa: E712
     )).scalars().all()
     rules_by_type: dict = {}
     for r in rules:
@@ -264,37 +259,30 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
     states = await get_all_vehicle_states()
 
     # Alert / work-order counts (grouped, no N+1)
-    alert_counts = dict((await db.execute(
-        select(Alert.vehicle_id, func.count())
-        .where(Alert.vehicle_id.in_(vehicle_ids), Alert.status == AlertStatus.ACTIVE)
-        .group_by(Alert.vehicle_id)
-    )).all())
-    wo_counts = dict((await db.execute(
-        select(WorkOrder.vehicle_id, func.count())
-        .where(
-            WorkOrder.vehicle_id.in_(vehicle_ids),
-            WorkOrder.status.in_([
-                WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS, WorkOrderStatus.SHADOW
-            ]),
-        )
-        .group_by(WorkOrder.vehicle_id)
-    )).all())
+    alert_counts, wo_counts = await _alert_wo_counts(db, vehicle_ids)
 
     health_order = {AssetHealth.RED: 0, AssetHealth.YELLOW: 1, AssetHealth.GREY: 2, AssetHealth.GREEN: 3}
 
     items: List[VehicleLiveItem] = []
     for v in vehicles:
         state = states.get(v.id) or {}
-        is_live = _is_state_live(state)
-        live = state.get("sensors") or {} if is_live else {}
-        gps = state.get("gps") or {} if is_live else {}
+        snapshot_live = _is_fresh(state.get("timestamp"))
+        live_sensors = state.get("sensors") or {}
+        gps = state.get("gps") or {} if snapshot_live else {}
 
         sensor_items: List[LiveSensorItem] = []
         for s in sensors_by_vehicle.get(v.id, []):
-            reading = live.get(s.sensor_type) or {}
-            value = reading.get("value") if is_live else None
-            sensor_rules = rules_by_type.get(s.sensor_type, [])
-            direction = _infer_direction(s, sensor_rules)
+            reading = live_sensors.get(s.sensor_type) or {}
+            # Per-sensor freshness; legacy snapshots without per-sensor
+            # timestamps fall back to the snapshot timestamp.
+            reading_fresh = _is_fresh(reading.get("timestamp") or state.get("timestamp"))
+            value = reading.get("value") if reading_fresh else None
+
+            vehicle_rules = [
+                r for r in rules_by_type.get(s.sensor_type, [])
+                if r.vehicle_id is None or r.vehicle_id == v.id
+            ]
+            direction = _infer_direction(s, vehicle_rules)
             sensor_items.append(LiveSensorItem(
                 sensor_type=s.sensor_type,
                 name=s.name,
@@ -311,15 +299,15 @@ async def get_fleet_live(db: AsyncSession = Depends(get_db)):
                     threshold_value=r.threshold_value,
                     duration_seconds=r.duration_seconds or 0,
                     severity=r.severity,
-                ) for r in sensor_rules],
+                ) for r in vehicle_rules],
             ))
 
         items.append(VehicleLiveItem(
             id=v.id, name=v.name, imei=v.imei, license_plate=v.license_plate,
             health=v.health, last_seen=v.last_seen,
-            ignition=state.get("ignition") if is_live else None,
-            speed=gps.get("speed") if is_live else None,
-            telemetry_timestamp=state.get("timestamp") if is_live else None,
+            ignition=state.get("ignition") if snapshot_live else None,
+            speed=gps.get("speed") if snapshot_live else None,
+            telemetry_timestamp=state.get("timestamp") if snapshot_live else None,
             active_alert_count=alert_counts.get(v.id, 0),
             open_work_order_count=wo_counts.get(v.id, 0),
             sensors=sensor_items,
@@ -337,7 +325,8 @@ async def get_vehicle_readings(
     limit: int = Query(500, ge=1, le=5000),
     db: AsyncSession = Depends(get_db),
 ):
-    """Time-series sensor readings for a vehicle (default: last 1 hour)."""
+    """Raw time-series sensor readings for a vehicle (default: last 1 hour).
+    For long ranges prefer /vehicles/{id}/history which serves bucketed data."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     stmt = (
         select(SensorReading)
@@ -353,12 +342,128 @@ async def get_vehicle_readings(
     return list(reversed(readings))
 
 
+def _pick_resolution(hours: int) -> str:
+    if hours <= 6:
+        return "raw"
+    if hours <= 168:          # up to 7 days → 1-minute buckets
+        return "1m"
+    return "1h"
+
+
+@router.get("/vehicles/{vehicle_id}/history", response_model=SensorHistoryOut)
+async def get_vehicle_sensor_history(
+    vehicle_id: int,
+    sensor_type: str,
+    hours: int = Query(24, ge=1, le=2160),   # up to 90 days
+    resolution: str = Query("auto", pattern="^(auto|raw|1m|1h)$"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bucketed sensor history served from TimescaleDB continuous aggregates.
+
+    resolution=auto picks raw ≤ 6h, 1-minute buckets ≤ 7 days, hourly beyond.
+    Raw points return min == max == value so the chart contract is uniform.
+    """
+    res = _pick_resolution(hours) if resolution == "auto" else resolution
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    if res == "raw":
+        result = await db.execute(
+            select(SensorReading.timestamp, SensorReading.value)
+            .where(
+                SensorReading.vehicle_id == vehicle_id,
+                SensorReading.sensor_type == sensor_type,
+                SensorReading.timestamp >= since,
+            )
+            .order_by(SensorReading.timestamp.asc())
+            .limit(5000)
+        )
+        points = [
+            HistoryPoint(t=t, value=val, min_value=val, max_value=val, count=1)
+            for t, val in result.all()
+        ]
+        return SensorHistoryOut(sensor_type=sensor_type, resolution="raw", points=points)
+
+    view = "sensor_readings_1m" if res == "1m" else "sensor_readings_1h"
+    try:
+        result = await db.execute(
+            text(
+                f"SELECT bucket, avg_value, min_value, max_value, sample_count "
+                f"FROM {view} "
+                f"WHERE vehicle_id = :vid AND sensor_type = :stype AND bucket >= :since "
+                f"ORDER BY bucket ASC LIMIT 5000"
+            ),
+            {"vid": vehicle_id, "stype": sensor_type, "since": since},
+        )
+        rows = result.all()
+    except Exception:
+        # Aggregate views missing (e.g. fresh DB before policies ran) —
+        # degrade to raw so the chart still renders.
+        return await get_vehicle_sensor_history(
+            vehicle_id, sensor_type, hours=min(hours, 168), resolution="raw", db=db
+        )
+
+    points = [
+        HistoryPoint(t=bucket, value=avg_v, min_value=min_v, max_value=max_v, count=cnt)
+        for bucket, avg_v, min_v, max_v, cnt in rows
+    ]
+    return SensorHistoryOut(sensor_type=sensor_type, resolution=res, points=points)
+
+
+@router.get("/vehicles/{vehicle_id}/timeline", response_model=List[TimelineEvent])
+async def get_vehicle_timeline(
+    vehicle_id: int,
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """Merged event stream for one vehicle: alerts, work orders, maintenance."""
+    vehicle = (await db.execute(
+        select(Vehicle.id).where(Vehicle.id == vehicle_id)
+    )).scalar_one_or_none()
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    alerts = (await db.execute(
+        select(Alert).where(Alert.vehicle_id == vehicle_id)
+        .order_by(Alert.created_at.desc()).limit(limit)
+    )).scalars().all()
+    wos = (await db.execute(
+        select(WorkOrder).where(WorkOrder.vehicle_id == vehicle_id)
+        .order_by(WorkOrder.created_at.desc()).limit(limit)
+    )).scalars().all()
+    events = (await db.execute(
+        select(MaintenanceHistory).where(MaintenanceHistory.vehicle_id == vehicle_id)
+        .order_by(MaintenanceHistory.event_date.desc()).limit(limit)
+    )).scalars().all()
+
+    timeline: List[TimelineEvent] = []
+    for a in alerts:
+        timeline.append(TimelineEvent(
+            kind="alert", id=a.id, timestamp=a.created_at, title=a.title,
+            description=a.message, severity=a.severity.value, status=a.status.value,
+            work_order_id=a.work_order_id,
+        ))
+    for w in wos:
+        timeline.append(TimelineEvent(
+            kind="work_order", id=w.id, timestamp=w.created_at, title=w.title,
+            description=w.description, status=w.status.value, alert_id=w.alert_id,
+        ))
+    for e in events:
+        timeline.append(TimelineEvent(
+            kind="maintenance", id=e.id, timestamp=e.event_date, title=e.title,
+            description=e.description, status=e.event_type,
+            work_order_id=e.work_order_id,
+        ))
+
+    timeline.sort(key=lambda x: x.timestamp, reverse=True)
+    return timeline[:limit]
+
+
 @router.get("/vehicles/{vehicle_id}/latest", response_model=dict)
 async def get_vehicle_latest(vehicle_id: int, db: AsyncSession = Depends(get_db)):
     """Latest cached state for a vehicle (from Redis)."""
     from app.db.redis_client import get_vehicle_state
     state = await get_vehicle_state(vehicle_id)
-    if state and not _is_state_live(state):
+    if state and not _is_fresh(state.get("timestamp")):
         state = None
     if not state:
         # Fallback: query latest reading per sensor type

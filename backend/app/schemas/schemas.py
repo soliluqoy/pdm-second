@@ -169,6 +169,7 @@ class RuleBase(BaseModel):
     name: str = Field(..., max_length=100)
     description: Optional[str] = None
     rule_type: RuleType
+    vehicle_id: Optional[int] = None    # None = fleet-wide
     sensor_id: Optional[int] = None
     sensor_type: Optional[str] = None
     operator: Optional[str] = None
@@ -189,6 +190,7 @@ class RuleUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     rule_type: Optional[RuleType] = None
+    vehicle_id: Optional[int] = None
     sensor_id: Optional[int] = None
     sensor_type: Optional[str] = None
     operator: Optional[str] = None
@@ -203,6 +205,7 @@ class RuleUpdate(BaseModel):
 
 class RuleOut(RuleBase, ORMBase):
     id: int
+    dormant: Optional[bool] = None   # active but no provisioned sensor matches
     created_at: datetime
     updated_at: datetime
 
@@ -289,6 +292,7 @@ class WorkOrderOut(ORMBase):
     is_shadow: bool
     vehicle_name: Optional[str] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 class WorkOrderComplete(BaseModel):
@@ -422,6 +426,37 @@ class TelemetryCatalogOut(BaseModel):
 
 
 # =============================================================================
+# History (time-bucketed sensor series + merged event timeline)
+# =============================================================================
+class HistoryPoint(BaseModel):
+    """One point of a sensor series. Raw points have min == max == value."""
+    t: datetime
+    value: float
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    count: int = 1
+
+
+class SensorHistoryOut(BaseModel):
+    sensor_type: str
+    resolution: Literal["raw", "1m", "1h"]
+    points: List[HistoryPoint]
+
+
+class TimelineEvent(BaseModel):
+    """Merged vehicle event stream item (alert / work order / maintenance)."""
+    kind: Literal["alert", "work_order", "maintenance"]
+    id: int
+    timestamp: datetime
+    title: str
+    description: Optional[str] = None
+    severity: Optional[str] = None     # alerts
+    status: Optional[str] = None       # alerts + work orders
+    work_order_id: Optional[int] = None
+    alert_id: Optional[int] = None
+
+
+# =============================================================================
 # Maintenance History
 # =============================================================================
 class MaintenanceHistoryOut(ORMBase):
@@ -463,7 +498,7 @@ class UserCreate(UserBase):
     pass
 
 
-class UserOut(ORMBase):
+class UserOut(UserBase, ORMBase):
     id: int
 
 

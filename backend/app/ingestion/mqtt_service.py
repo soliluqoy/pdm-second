@@ -7,6 +7,11 @@ This is the "adapter seam": the fmc-bridge service (bridge/) decodes each
 tracker's Teltonika AVL protocol and republishes here as JSON on
 teltonika/{imei}/telemetry — so this service needs zero hardware knowledge.
 
+Backpressure: paho callbacks push raw messages onto a bounded asyncio.Queue
+consumed by a small worker pool. A device flushing a multi-hour store-and-
+forward buffer therefore cannot spawn unbounded concurrent DB sessions; when
+the queue is full the oldest message is dropped (readings are re-sent by the
+device until ACKed at the bridge, and rules skip stale records anyway).
 """
 import asyncio
 import json
@@ -21,21 +26,27 @@ from sqlalchemy import select
 from app.config import settings
 from app.db.database import async_session_factory
 from app.db.models import SensorReading, Vehicle, AssetHealth
-from app.db.redis_client import set_vehicle_state, publish_telemetry, publish_health_update
+from app.db.redis_client import merge_vehicle_state, publish_telemetry, publish_health_update
 from app.rules.engine import evaluate_dtc, evaluate_telemetry
 
 logger = logging.getLogger("predict.ingestion")
 
+QUEUE_MAXSIZE = 1000
+WORKER_COUNT = 3
+
 
 class MQTTIngestionService:
     """MQTT subscriber that ingests telematics data into the system.
-    Runs paho-mqtt in a background thread, bridges callbacks to asyncio."""
+    Runs paho-mqtt in a background thread; messages are handed to asyncio
+    workers through a bounded queue."""
 
     def __init__(self):
         self.client: Optional[mqtt.Client] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._running = False
+        self._queue: Optional[asyncio.Queue] = None
+        self._workers: list[asyncio.Task] = []
+        self._dropped = 0
 
     # ── MQTT Callbacks (called from paho's thread) ─────────────────────────────
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
@@ -52,11 +63,38 @@ class MQTTIngestionService:
         logger.warning("MQTT disconnected, reason_code=%s", reason_code)
 
     def on_message(self, client, userdata, msg):
-        """Bridge MQTT message to asyncio loop."""
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._handle_message(msg.topic, msg.payload), self._loop
-            )
+        """Enqueue the message for the asyncio worker pool (thread-safe)."""
+        if not (self._loop and self._loop.is_running() and self._queue is not None):
+            return
+        self._loop.call_soon_threadsafe(self._enqueue, msg.topic, msg.payload)
+
+    def _enqueue(self, topic: str, payload: bytes) -> None:
+        try:
+            self._queue.put_nowait((topic, payload))
+        except asyncio.QueueFull:
+            # Drop the oldest message to keep latency bounded during bursts.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait((topic, payload))
+            except asyncio.QueueEmpty:
+                pass
+            self._dropped += 1
+            if self._dropped % 100 == 1:
+                logger.warning("Ingestion queue full — dropped %d message(s) so far",
+                               self._dropped)
+
+    # ── Worker pool ─────────────────────────────────────────────────────────────
+    async def _worker(self, worker_id: int):
+        while True:
+            topic, payload = await self._queue.get()
+            try:
+                await self._handle_message(topic, payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Worker %d failed on %s: %s", worker_id, topic, e)
+            finally:
+                self._queue.task_done()
 
     # ── Async message handler ──────────────────────────────────────────────────
     async def _handle_message(self, topic: str, payload: bytes):
@@ -99,9 +137,12 @@ class MQTTIngestionService:
 
             gps = data.get("gps", {})
             sensors = data.get("sensors", {})
-            ignition = data.get("ignition", True)
+            # None (unknown) when the record doesn't carry the ignition flag —
+            # defaulting to True would pollute idle/trip analytics.
+            ignition = data.get("ignition")
 
-            # Store each sensor reading
+            # Build all readings for this record, insert in one batch
+            readings = []
             readings_added = []
             for sensor_type, value in sensors.items():
                 if value is None:
@@ -117,7 +158,7 @@ class MQTTIngestionService:
                 if val is None:
                     continue
 
-                reading = SensorReading(
+                readings.append(SensorReading(
                     timestamp=ts,
                     vehicle_id=vehicle.id,
                     imei=imei,
@@ -130,39 +171,43 @@ class MQTTIngestionService:
                     longitude=gps.get("longitude"),
                     speed=gps.get("speed"),
                     ignition=ignition,
-                )
-                session.add(reading)
+                ))
                 readings_added.append({
                     "sensor_type": sensor_type,
                     "value": float(val),
                     "unit": unit,
                 })
+            session.add_all(readings)
 
-            # Update vehicle last_seen
-            vehicle.last_seen = ts
+            # Update vehicle last_seen (only forward — buffered uploads can
+            # replay old records after newer ones)
+            if vehicle.last_seen is None or ts > vehicle.last_seen:
+                vehicle.last_seen = ts
 
-            # Update health to GREEN if was GREY (first data)
+            # Update health to GREEN if was GREY (first / resumed data)
             was_grey = vehicle.health == AssetHealth.GREY
             if was_grey:
                 vehicle.health = AssetHealth.GREEN
 
             await session.commit()
 
-            # Build latest state snapshot for Redis
-            state = {
+            # Merge (not replace) the latest-state snapshot in Redis: AVL
+            # records legitimately omit IO elements, so a replace would blank
+            # out sensor tiles until the next full record.
+            partial_state = {
                 "timestamp": ts.isoformat(),
                 "imei": imei,
                 "vehicle_id": vehicle.id,
                 "vehicle_name": vehicle.name,
                 "ignition": ignition,
-                "gps": gps,
+                "gps": gps or None,
                 "sensors": {r["sensor_type"]: {"value": r["value"], "unit": r["unit"]}
                             for r in readings_added},
             }
-            await set_vehicle_state(vehicle.id, state)
+            merged_state = await merge_vehicle_state(vehicle.id, partial_state)
 
-            # Publish telemetry event for WebSocket
-            await publish_telemetry(vehicle.id, state)
+            # Publish telemetry event for WebSocket (merged view)
+            await publish_telemetry(vehicle.id, merged_state)
 
             if was_grey:
                 await publish_health_update(vehicle.id, AssetHealth.GREEN.value)
@@ -173,13 +218,15 @@ class MQTTIngestionService:
             record_age = (datetime.now(timezone.utc) - ts).total_seconds()
             if record_age <= settings.RULE_MAX_RECORD_AGE_SECONDS:
                 try:
-                    await evaluate_telemetry(vehicle.id, imei, sensors, ts)
+                    await evaluate_telemetry(
+                        vehicle.id, imei, sensors, ts,
+                        session=session, vehicle_name=vehicle.name,
+                    )
                 except Exception as e:
                     logger.error("Rule engine error: %s", e)
             else:
                 logger.debug("Skipping rule evaluation: stale record "
                              "(age=%.0fs) vehicle=%s", record_age, vehicle.name)
-
 
             logger.debug("Ingested %d readings for vehicle %s (IMEI %s)",
                          len(readings_added), vehicle.name, imei)
@@ -212,10 +259,12 @@ class MQTTIngestionService:
                 return
 
             try:
-                await evaluate_dtc(vehicle.id, imei, dtc_code, description, severity)
+                await evaluate_dtc(
+                    vehicle.id, imei, dtc_code, description, severity,
+                    session=session, vehicle_name=vehicle.name,
+                )
             except Exception as e:
                 logger.error("DTC rule engine error: %s", e)
-
 
     @staticmethod
     def _parse_timestamp(timestamp_str: Optional[str]) -> datetime:
@@ -261,9 +310,12 @@ class MQTTIngestionService:
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
     def start(self, loop: asyncio.AbstractEventLoop):
-        """Start the MQTT subscriber in a background thread."""
+        """Start the worker pool and the MQTT subscriber thread."""
         self._loop = loop
-        self._running = True
+        self._queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        self._workers = [
+            loop.create_task(self._worker(i)) for i in range(WORKER_COUNT)
+        ]
 
         self.client = mqtt.Client(
             client_id=f"predict-backend-{id(self)}",
@@ -278,7 +330,8 @@ class MQTTIngestionService:
 
         self._thread = threading.Thread(target=self._run_mqtt, daemon=True)
         self._thread.start()
-        logger.info("MQTT ingestion service started")
+        logger.info("MQTT ingestion service started (%d workers, queue %d)",
+                    WORKER_COUNT, QUEUE_MAXSIZE)
 
     def _run_mqtt(self):
         """Run the MQTT client loop in a background thread."""
@@ -289,13 +342,15 @@ class MQTTIngestionService:
             logger.error("MQTT connection error: %s", e)
 
     def stop(self):
-        """Stop the MQTT subscriber."""
-        self._running = False
+        """Stop the MQTT subscriber and workers."""
         if self.client:
             self.client.disconnect()
             self.client.loop_stop()
         if self._thread:
             self._thread.join(timeout=5)
+        for task in self._workers:
+            task.cancel()
+        self._workers = []
         logger.info("MQTT ingestion service stopped")
 
 

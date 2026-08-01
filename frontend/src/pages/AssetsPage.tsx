@@ -2,6 +2,7 @@
  * PREDICT — Assets Page
  */
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import type {
   Fleet,
@@ -10,12 +11,12 @@ import type {
   Sensor,
   MaintenanceHistory,
   AssetHealth,
-  WSMessage,
   DeviceType,
 } from '../types';
 import Badge from '../components/ui/Badge';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { useWsSubscription } from '../ws/WsContext';
 import {
   HOST_PLACEHOLDER,
   TRACKER_PORT,
@@ -52,7 +53,12 @@ const emptyForm = {
   fleet_id: '',
 };
 
-export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) {
+interface ThresholdDraft {
+  warning: string;
+  critical: string;
+}
+
+export default function AssetsPage() {
   const [fleets, setFleets] = useState<Fleet[]>([]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [selectedVehicle, setSelectedVehicle] = useState<Vehicle | null>(null);
@@ -67,7 +73,9 @@ export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) 
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [smsVehicle, setSmsVehicle] = useState<Vehicle | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
-  const lastWsIdx = useRef(0);
+  const [editingSensor, setEditingSensor] = useState<number | null>(null);
+  const [thresholdDraft, setThresholdDraft] = useState<ThresholdDraft>({ warning: '', critical: '' });
+  const [sensorError, setSensorError] = useState<string | null>(null);
   const refreshTimer = useRef<number | null>(null);
 
   const sortVehicles = (list: Vehicle[]) =>
@@ -124,37 +132,62 @@ export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) 
     return () => clearInterval(interval);
   }, [fetchFleets, fetchVehicles]);
 
-  useEffect(() => {
-    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
-      const msg = wsMessages[i];
-      if (msg.channel === 'ws:health') {
-        const vehicleId = msg.data?.vehicle_id;
-        const health = msg.data?.health;
-        if (vehicleId && health) {
-          setVehicles((prev) =>
-            sortVehicles(
-              prev.map((v) =>
-                v.id === vehicleId ? { ...v, health: health as AssetHealth } : v
-              )
+  useWsSubscription(['ws:health', 'ws:alerts', 'ws:workorders'], (msg) => {
+    if (msg.channel === 'ws:health') {
+      const vehicleId = msg.data?.vehicle_id;
+      const health = msg.data?.health;
+      if (vehicleId && health) {
+        setVehicles((prev) =>
+          sortVehicles(
+            prev.map((v) =>
+              v.id === vehicleId ? { ...v, health: health as AssetHealth } : v
             )
-          );
-          setSelectedVehicle((prev) => {
-            if (!prev || prev.id !== vehicleId) return prev;
-            return { ...prev, health: health as AssetHealth };
-          });
-        }
-      } else if (msg.channel === 'ws:alerts' || msg.channel === 'ws:workorders') {
-        scheduleRefresh();
-        if (selectedVehicle && msg.channel === 'ws:workorders') {
-          const vehicleId = msg.data?.vehicle_id;
-          if (vehicleId === selectedVehicle.id) {
-            fetchHistory(selectedVehicle.id);
-          }
+          )
+        );
+        setSelectedVehicle((prev) => {
+          if (!prev || prev.id !== vehicleId) return prev;
+          return { ...prev, health: health as AssetHealth };
+        });
+      }
+    } else {
+      scheduleRefresh();
+      if (selectedVehicle && msg.channel === 'ws:workorders') {
+        const vehicleId = msg.data?.vehicle_id;
+        if (vehicleId === selectedVehicle.id) {
+          fetchHistory(selectedVehicle.id);
         }
       }
     }
-    lastWsIdx.current = wsMessages.length;
-  }, [wsMessages, scheduleRefresh, selectedVehicle, fetchHistory]);
+  });
+
+  const startEditThresholds = (s: Sensor) => {
+    setEditingSensor(s.id);
+    setSensorError(null);
+    setThresholdDraft({
+      warning: s.warning_threshold != null ? String(s.warning_threshold) : '',
+      critical: s.critical_threshold != null ? String(s.critical_threshold) : '',
+    });
+  };
+
+  const saveThresholds = async (s: Sensor) => {
+    setSensorError(null);
+    const warning = thresholdDraft.warning.trim() === '' ? null : Number(thresholdDraft.warning);
+    const critical = thresholdDraft.critical.trim() === '' ? null : Number(thresholdDraft.critical);
+    if ((warning != null && Number.isNaN(warning)) || (critical != null && Number.isNaN(critical))) {
+      setSensorError('Thresholds must be numbers.');
+      return;
+    }
+    try {
+      const updated = await api.updateSensor(s.id, {
+        warning_threshold: warning,
+        critical_threshold: critical,
+      });
+      setSensors((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+      setEditingSensor(null);
+    } catch (e) {
+      setSensorError(e instanceof Error ? e.message : 'Failed to save thresholds');
+    }
+  };
 
   const selectVehicle = useCallback(async (v: Vehicle) => {
     setSelectedVehicle(v);
@@ -401,28 +434,80 @@ export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) 
             ) : (
               sensors.map((s) => (
                 <div key={s.id} className="px-4 py-3 border-b border-gray-100">
-                  <p className="font-medium text-gray-900">{s.name}</p>
-                  <p className="text-sm text-gray-600">{s.sensor_type} · {s.unit}</p>
-                  <dl className="mt-2 text-sm space-y-1">
-                    {s.io_element_id && (
-                      <div className="flex justify-between gap-4">
-                        <dt className="text-gray-500">IO element</dt>
-                        <dd className="text-gray-900">{s.io_element_id}</dd>
-                      </div>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="font-medium text-gray-900">{s.name}</p>
+                      <p className="text-sm text-gray-600">{s.sensor_type} · {s.unit || '—'}</p>
+                    </div>
+                    {editingSensor !== s.id && (
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs"
+                        onClick={() => startEditThresholds(s)}
+                      >
+                        Edit
+                      </button>
                     )}
-                    {s.warning_threshold != null && (
+                  </div>
+                  {editingSensor === s.id ? (
+                    <div className="mt-2 space-y-2">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-xs text-gray-500">Warning</label>
+                          <input
+                            type="number"
+                            className="filter-select w-full mt-0.5 text-sm"
+                            value={thresholdDraft.warning}
+                            onChange={(e) => setThresholdDraft((d) => ({ ...d, warning: e.target.value }))}
+                            placeholder="—"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500">Critical</label>
+                          <input
+                            type="number"
+                            className="filter-select w-full mt-0.5 text-sm"
+                            value={thresholdDraft.critical}
+                            onChange={(e) => setThresholdDraft((d) => ({ ...d, critical: e.target.value }))}
+                            placeholder="—"
+                          />
+                        </div>
+                      </div>
+                      {sensorError && <p className="text-xs text-red-700">{sensorError}</p>}
+                      <div className="flex gap-2">
+                        <button type="button" className="btn-primary text-xs" onClick={() => saveThresholds(s)}>
+                          Save
+                        </button>
+                        <button type="button" className="btn-secondary text-xs" onClick={() => setEditingSensor(null)}>
+                          Cancel
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-gray-400">
+                        Display thresholds color the dashboard tiles. Alert firing is controlled by Rules.
+                      </p>
+                    </div>
+                  ) : (
+                    <dl className="mt-2 text-sm space-y-1">
+                      {s.io_element_id && (
+                        <div className="flex justify-between gap-4">
+                          <dt className="text-gray-500">IO element</dt>
+                          <dd className="text-gray-900">{s.io_element_id}</dd>
+                        </div>
+                      )}
                       <div className="flex justify-between gap-4">
                         <dt className="text-gray-500">Warning</dt>
-                        <dd className="text-amber-700 tabular-nums">{s.warning_threshold}{s.unit}</dd>
+                        <dd className="text-amber-700 tabular-nums">
+                          {s.warning_threshold != null ? `${s.warning_threshold}${s.unit || ''}` : '—'}
+                        </dd>
                       </div>
-                    )}
-                    {s.critical_threshold != null && (
                       <div className="flex justify-between gap-4">
                         <dt className="text-gray-500">Critical</dt>
-                        <dd className="text-red-700 tabular-nums">{s.critical_threshold}{s.unit}</dd>
+                        <dd className="text-red-700 tabular-nums">
+                          {s.critical_threshold != null ? `${s.critical_threshold}${s.unit || ''}` : '—'}
+                        </dd>
                       </div>
-                    )}
-                  </dl>
+                    </dl>
+                  )}
                 </div>
               ))
             )}
@@ -443,16 +528,21 @@ export default function AssetsPage({ wsMessages }: { wsMessages: WSMessage[] }) 
                 {selectedVehicle.license_plate ? ` · ${selectedVehicle.license_plate}` : ''}
               </p>
             </div>
-            <button
-              type="button"
-              className="btn-secondary text-sm"
-              onClick={() => {
-                setSmsVehicle(selectedVehicle);
-                setCopyStatus(null);
-              }}
-            >
-              SMS config helper
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <Link to={`/vehicles/${selectedVehicle.id}`} className="btn-primary text-sm">
+                Full history
+              </Link>
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                onClick={() => {
+                  setSmsVehicle(selectedVehicle);
+                  setCopyStatus(null);
+                }}
+              >
+                SMS config helper
+              </button>
+            </div>
           </header>
           <header className="px-4 py-2 border-b border-gray-100">
             <h3 className="text-sm font-medium text-gray-700">Maintenance history</h3>

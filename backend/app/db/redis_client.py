@@ -22,11 +22,53 @@ async def get_redis() -> redis.Redis:
     return redis_client
 
 
+# Live-state keys expire after a day so stale vehicles don't linger forever.
+STATE_TTL_SECONDS = 24 * 3600
+
+
 # ── Helpers: latest vehicle state ─────────────────────────────────────────────
 async def set_vehicle_state(vehicle_id: int, state: dict) -> None:
-    """Cache the latest sensor snapshot for a vehicle."""
+    """Cache the latest sensor snapshot for a vehicle (full replace)."""
     key = f"vehicle:{vehicle_id}:state"
-    await redis_client.set(key, json.dumps(state, default=str))
+    await redis_client.set(key, json.dumps(state, default=str), ex=STATE_TTL_SECONDS)
+
+
+async def merge_vehicle_state(vehicle_id: int, state: dict) -> dict:
+    """Merge a (possibly partial) telemetry snapshot into the cached state.
+
+    Teltonika AVL records legitimately omit IO elements, so a full replace
+    would blank out sensors until the next record that happens to carry them.
+    Sensors are merged per-type and each carries its own timestamp so the
+    dashboard can judge freshness per sensor. Returns the merged state.
+    """
+    key = f"vehicle:{vehicle_id}:state"
+    existing_raw = await redis_client.get(key)
+    merged = {}
+    if existing_raw:
+        try:
+            merged = json.loads(existing_raw)
+        except (ValueError, TypeError):
+            merged = {}
+
+    new_sensors = state.pop("sensors", {}) or {}
+    old_sensors = merged.get("sensors") or {}
+    ts = state.get("timestamp")
+    for sensor_type, reading in new_sensors.items():
+        if isinstance(reading, dict):
+            reading = {**reading, "timestamp": ts}
+        else:
+            reading = {"value": reading, "unit": None, "timestamp": ts}
+        old_sensors[sensor_type] = reading
+
+    # Top-level fields (timestamp, gps, ignition, ...) always come from the
+    # newest record; None values must not clobber known state.
+    for k, v in state.items():
+        if v is not None or k not in merged:
+            merged[k] = v
+    merged["sensors"] = old_sensors
+
+    await redis_client.set(key, json.dumps(merged, default=str), ex=STATE_TTL_SECONDS)
+    return merged
 
 
 async def get_vehicle_state(vehicle_id: int) -> Optional[dict]:

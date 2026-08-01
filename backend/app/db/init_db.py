@@ -86,10 +86,13 @@ SEED_RULES = [
      "rule_type": RuleType.THRESHOLD, "sensor_type": "engine_load",
      "operator": ">", "threshold_value": 95, "duration_seconds": 300,
      "severity": AlertSeverity.WARNING, "work_order_template": "High RPM Investigation"},
-    {"name": "Low Tire Pressure", "description": "Tire pressure < 200 kPa",
-     "rule_type": RuleType.THRESHOLD, "sensor_type": "tire_pressure_fl",
-     "operator": "<", "threshold_value": 200, "duration_seconds": 0,
-     "severity": AlertSeverity.WARNING, "work_order_template": "Tire Pressure Check"},
+    # NOTE: no tire-pressure rule — neither FMC001 nor FMC150 provisions a
+    # tire-pressure sensor (see provisioning.py). Add the sensor + rule together
+    # if dedicated TPMS hardware is installed.
+    {"name": "Low Vehicle Battery (CAN)", "description": "CAN-reported vehicle battery < 11.5V (FMC150)",
+     "rule_type": RuleType.THRESHOLD, "sensor_type": "vehicle_battery_voltage",
+     "operator": "<", "threshold_value": 11.5, "duration_seconds": 60,
+     "severity": AlertSeverity.CRITICAL, "work_order_template": "Low Battery Voltage"},
     {"name": "Service Due Soon", "description": "Less than 1000 km to scheduled service",
      "rule_type": RuleType.THRESHOLD, "sensor_type": "distance_until_service",
      "operator": "<", "threshold_value": 1000, "duration_seconds": 0,
@@ -201,6 +204,209 @@ async def _migrate_sim_phone():
     logger.info("sim_phone migration applied (vehicles).")
 
 
+async def _migrate_rule_vehicle_id():
+    """Add rules.vehicle_id for optional per-vehicle rule scoping."""
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE rules "
+            "ADD COLUMN IF NOT EXISTS vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_rules_vehicle_id ON rules (vehicle_id)"
+        ))
+    logger.info("rule vehicle_id migration applied (rules).")
+
+
+# FK delete behavior. create_all() never alters existing constraints, so
+# re-create them with the correct ON DELETE action on legacy databases.
+# (table, column, referenced_table, on_delete)
+_FK_ONDELETE_SPEC = [
+    ("vehicles", "fleet_id", "fleets", "SET NULL"),
+    ("components", "vehicle_id", "vehicles", "CASCADE"),
+    ("sensors", "component_id", "components", "CASCADE"),
+    ("sensor_readings", "vehicle_id", "vehicles", "CASCADE"),
+    ("alerts", "vehicle_id", "vehicles", "CASCADE"),
+    ("alerts", "rule_id", "rules", "SET NULL"),
+    ("alerts", "sensor_id", "sensors", "SET NULL"),
+    ("alerts", "work_order_id", "work_orders", "SET NULL"),
+    ("work_orders", "vehicle_id", "vehicles", "CASCADE"),
+    ("work_orders", "alert_id", "alerts", "SET NULL"),
+    ("work_orders", "template_id", "work_order_templates", "SET NULL"),
+    ("maintenance_history", "vehicle_id", "vehicles", "CASCADE"),
+    ("maintenance_history", "work_order_id", "work_orders", "SET NULL"),
+    ("rules", "sensor_id", "sensors", "SET NULL"),
+    ("rules", "vehicle_id", "vehicles", "CASCADE"),
+    ("rules", "work_order_template_id", "work_order_templates", "SET NULL"),
+]
+
+
+async def _migrate_fk_ondelete():
+    """Ensure every FK has the intended ON DELETE action (idempotent).
+
+    Without this, deleting a vehicle/rule/template with dependent rows raises
+    an FK violation and surfaces as HTTP 500.
+    """
+    sql = """
+    DO $$
+    DECLARE
+        spec RECORD;
+        con RECORD;
+    BEGIN
+        FOR spec IN
+            SELECT * FROM (VALUES {values}) AS t(tbl, col, ref_tbl, action)
+        LOOP
+            -- Find the existing FK on (tbl.col) whose delete rule differs
+            FOR con IN
+                SELECT c.conname
+                FROM pg_constraint c
+                JOIN pg_class r ON r.oid = c.conrelid
+                JOIN pg_attribute a ON a.attrelid = c.conrelid
+                     AND a.attnum = ANY (c.conkey)
+                WHERE c.contype = 'f'
+                  AND r.relname = spec.tbl
+                  AND a.attname = spec.col
+                  AND c.confdeltype <> (CASE spec.action
+                        WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' ELSE 'a' END)
+            LOOP
+                EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', spec.tbl, con.conname);
+                EXECUTE format(
+                    'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I (id) ON DELETE %s',
+                    spec.tbl, con.conname, spec.col, spec.ref_tbl, spec.action);
+                RAISE NOTICE 'FK %.% now ON DELETE %', spec.tbl, spec.col, spec.action;
+            END LOOP;
+        END LOOP;
+    END $$;
+    """
+    values = ",\n".join(
+        f"('{t}', '{c}', '{rt}', '{a}')" for t, c, rt, a in _FK_ONDELETE_SPEC
+    )
+    async with engine.begin() as conn:
+        await conn.execute(text(sql.replace("{values}", values)))
+    logger.info("FK ON DELETE migration applied.")
+
+
+async def _migrate_seed_rules_fixup():
+    """Data fix on existing databases: retire dormant seeded rules and add
+    the FMC150 battery rule (fresh DBs get the corrected SEED_RULES)."""
+    async with async_session_factory() as session:
+        # The tire-pressure rule can never fire: no catalog/bridge source.
+        await session.execute(text(
+            "UPDATE rules SET is_active = false "
+            "WHERE sensor_type = 'tire_pressure_fl' AND is_active = true"
+        ))
+        # FMC150 reports vehicle battery as vehicle_battery_voltage (AVL 168).
+        existing = await session.execute(text(
+            "SELECT 1 FROM rules WHERE sensor_type = 'vehicle_battery_voltage' LIMIT 1"
+        ))
+        if existing.scalar() is None:
+            tpl = await session.execute(text(
+                "SELECT id FROM work_order_templates WHERE name = 'Low Battery Voltage' LIMIT 1"
+            ))
+            tpl_id = tpl.scalar()
+            await session.execute(text(
+                "INSERT INTO rules (name, description, rule_type, sensor_type, operator, "
+                " threshold_value, duration_seconds, severity, work_order_template_id, "
+                " is_active, created_at, updated_at) "
+                "VALUES ('Low Vehicle Battery (CAN)', "
+                " 'CAN-reported vehicle battery < 11.5V (FMC150)', 'threshold', "
+                " 'vehicle_battery_voltage', '<', 11.5, 60, 'critical', :tpl, true, now(), now())"
+            ), {"tpl": tpl_id})
+        await session.commit()
+    logger.info("Seed-rule fixup applied (tire rule retired, FMC150 battery rule ensured).")
+
+
+# ── TimescaleDB lifecycle: compression, retention, continuous aggregates ──────
+async def _setup_timescale_policies():
+    """Compression + retention + 1m/1h continuous aggregates (all idempotent).
+
+    Without these, sensor_readings grows unbounded and long-range history
+    queries scan raw 10-second data.
+    """
+    from app.config import settings as cfg
+
+    autocommit = await engine.connect()
+    try:
+        conn = await autocommit.execution_options(isolation_level="AUTOCOMMIT")
+
+        # Compression (segment by vehicle + sensor for efficient per-sensor scans)
+        try:
+            await conn.execute(text(
+                "ALTER TABLE sensor_readings SET ("
+                "  timescaledb.compress,"
+                "  timescaledb.compress_segmentby = 'vehicle_id, sensor_type',"
+                "  timescaledb.compress_orderby = 'timestamp DESC'"
+                ")"
+            ))
+            await conn.execute(text(
+                "SELECT add_compression_policy('sensor_readings', INTERVAL '7 days', "
+                "if_not_exists => TRUE)"
+            ))
+        except Exception as e:
+            logger.warning("Compression setup skipped: %s", e)
+
+        # Retention
+        try:
+            await conn.execute(text(
+                f"SELECT add_retention_policy('sensor_readings', "
+                f"INTERVAL '{int(cfg.READINGS_RETENTION_DAYS)} days', if_not_exists => TRUE)"
+            ))
+        except Exception as e:
+            logger.warning("Retention setup skipped: %s", e)
+
+        # Continuous aggregates (1 minute + 1 hour rollups)
+        for view, bucket, start_off, end_off, sched in (
+            ("sensor_readings_1m", "1 minute", "2 hours", "10 minutes", "10 minutes"),
+            ("sensor_readings_1h", "1 hour", "2 days", "1 hour", "1 hour"),
+        ):
+            try:
+                await conn.execute(text(
+                    f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view} "
+                    f"WITH (timescaledb.continuous) AS "
+                    f"SELECT time_bucket(INTERVAL '{bucket}', timestamp) AS bucket, "
+                    f"       vehicle_id, sensor_type, "
+                    f"       avg(value) AS avg_value, min(value) AS min_value, "
+                    f"       max(value) AS max_value, count(*) AS sample_count "
+                    f"FROM sensor_readings "
+                    f"GROUP BY bucket, vehicle_id, sensor_type "
+                    f"WITH NO DATA"
+                ))
+                await conn.execute(text(
+                    f"SELECT add_continuous_aggregate_policy('{view}', "
+                    f"start_offset => INTERVAL '{start_off}', "
+                    f"end_offset => INTERVAL '{end_off}', "
+                    f"schedule_interval => INTERVAL '{sched}', if_not_exists => TRUE)"
+                ))
+            except Exception as e:
+                logger.warning("Continuous aggregate %s skipped: %s", view, e)
+
+        logger.info("TimescaleDB policies applied (compression, retention, aggregates).")
+    finally:
+        await autocommit.close()
+
+
+async def audit_dormant_rules():
+    """Log active rules whose sensor_type matches no provisioned sensor.
+
+    These rules can never fire — usually a typo or a sensor that is not in
+    the provisioning catalog. Surfaced in logs and via GET /api/v1/rules.
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(text(
+            "SELECT r.id, r.name, r.sensor_type FROM rules r "
+            "WHERE r.is_active = true AND r.rule_type = 'threshold' "
+            "  AND r.sensor_type IS NOT NULL "
+            "  AND NOT EXISTS (SELECT 1 FROM sensors s WHERE s.sensor_type = r.sensor_type)"
+        ))
+        rows = result.all()
+        for rid, name, stype in rows:
+            logger.warning(
+                "DORMANT RULE: id=%s %r targets sensor_type=%r which no "
+                "registered vehicle provisions — it will never fire.",
+                rid, name, stype,
+            )
+        return [row[0] for row in rows]
+
+
 async def init_database():
     """Create all tables and set up TimescaleDB hypertable."""
     # Import all models to register them with Base
@@ -230,6 +436,11 @@ async def init_database():
     # Add columns introduced after the first schema (existing DBs only)
     await _migrate_device_type()
     await _migrate_sim_phone()
+    await _migrate_rule_vehicle_id()
+    await _migrate_fk_ondelete()
+
+    # Compression / retention / continuous aggregates
+    await _setup_timescale_policies()
 
     logger.info("Database tables created successfully.")
 
@@ -244,7 +455,8 @@ async def seed_database():
         # Check if already seeded (users table is our idempotency marker)
         result = await session.execute(text("SELECT COUNT(*) FROM users"))
         if result.scalar() > 0:
-            logger.info("Database already seeded, skipping.")
+            logger.info("Database already seeded, skipping (applying rule fixups).")
+            await _migrate_seed_rules_fixup()
             return
 
         logger.info("Seeding operational data (users, templates, rules)...")

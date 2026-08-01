@@ -4,12 +4,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { WorkOrder, WorkOrderPriority, WorkOrderStatus, WSMessage } from '../types';
+import type { User, WorkOrder, WorkOrderPriority, WorkOrderStatus } from '../types';
 import Badge from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import FilterBar from '../components/ui/FilterBar';
 import LoadingState from '../components/ui/LoadingState';
 import PageHeader from '../components/ui/PageHeader';
+import { useWsSubscription } from '../ws/WsContext';
 
 const statusTone: Record<string, 'purple' | 'info' | 'warning' | 'success' | 'neutral' | 'danger'> = {
   shadow: 'purple',
@@ -27,17 +28,19 @@ const priorityTone: Record<string, 'danger' | 'warning' | 'info' | 'neutral'> = 
   low: 'neutral',
 };
 
-export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[] }) {
+export default function WorkOrdersPage() {
   const [workOrders, setWorkOrders] = useState<WorkOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [shadowMode, setShadowMode] = useState(false);
+  const [users, setUsers] = useState<User[]>([]);
   const [filterStatus, setFilterStatus] = useState<string>('');
   const [filterPriority, setFilterPriority] = useState<string>('');
   const [selectedWO, setSelectedWO] = useState<WorkOrder | null>(null);
   const [showCompleteModal, setShowCompleteModal] = useState(false);
-  const [completedBy, setCompletedBy] = useState('tech1');
+  const [showAssignFor, setShowAssignFor] = useState<WorkOrder | null>(null);
+  const [assignTo, setAssignTo] = useState('');
+  const [completedBy, setCompletedBy] = useState('');
   const [completionNotes, setCompletionNotes] = useState('');
-  const lastWsIdx = useRef(0);
   const refreshTimer = useRef<number | null>(null);
   const shadowDefaultApplied = useRef(false);
 
@@ -68,26 +71,29 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
         setFilterStatus('shadow');
       }
     }).catch(console.error);
+    api.getUsers().then((u) => {
+      setUsers(u);
+      const firstTech = u.find((x) => x.role === 'technician') ?? u[0];
+      if (firstTech) {
+        setAssignTo(firstTech.username);
+        setCompletedBy(firstTech.username);
+      }
+    }).catch(console.error);
   }, []);
 
   useEffect(() => {
     fetchWorkOrders();
-    const interval = setInterval(fetchWorkOrders, 10_000);
+    const interval = setInterval(fetchWorkOrders, 15_000);
     return () => clearInterval(interval);
   }, [fetchWorkOrders]);
 
-  useEffect(() => {
-    for (let i = lastWsIdx.current; i < wsMessages.length; i++) {
-      if (wsMessages[i].channel === 'ws:workorders') {
-        scheduleRefresh();
-      }
-    }
-    lastWsIdx.current = wsMessages.length;
-  }, [wsMessages, scheduleRefresh]);
+  useWsSubscription(['ws:workorders'], () => scheduleRefresh());
 
-  const handleAssign = async (id: number) => {
+  const handleAssign = async () => {
+    if (!showAssignFor || !assignTo) return;
     try {
-      await api.assignWorkOrder(id, 'tech1');
+      await api.assignWorkOrder(showAssignFor.id, assignTo);
+      setShowAssignFor(null);
       fetchWorkOrders();
     } catch (e) {
       console.error('Failed to assign:', e);
@@ -219,7 +225,10 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                   </td>
                   <td>
                     {wo.alert_id ? (
-                      <Link to="/alerts" className="text-predict-600 hover:underline text-sm">
+                      <Link
+                        to={`/alerts?highlight=${wo.alert_id}`}
+                        className="text-predict-600 hover:underline text-sm"
+                      >
                         #{wo.alert_id}
                       </Link>
                     ) : (
@@ -241,7 +250,7 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                         </>
                       )}
                       {(wo.status === 'open' || (wo.status === 'shadow' && !shadowMode)) && (
-                        <button onClick={() => handleAssign(wo.id)} className="btn-secondary">
+                        <button onClick={() => setShowAssignFor(wo)} className="btn-secondary">
                           Assign
                         </button>
                       )}
@@ -292,9 +301,11 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
                   onChange={(e) => setCompletedBy(e.target.value)}
                   className="filter-select w-full mt-1"
                 >
-                  <option value="tech1">John Technician</option>
-                  <option value="tech2">Sarah Technician</option>
-                  <option value="manager">Fleet Manager</option>
+                  {users.map((u) => (
+                    <option key={u.id} value={u.username}>
+                      {u.display_name}
+                    </option>
+                  ))}
                 </select>
               </div>
               <div>
@@ -326,6 +337,39 @@ export default function WorkOrdersPage({ wsMessages }: { wsMessages: WSMessage[]
               </button>
               <button onClick={handleComplete} className="btn-primary">
                 Mark complete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAssignFor && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="panel max-w-sm w-full shadow-lg">
+            <div className="px-5 py-4 border-b border-gray-200">
+              <h3 className="text-lg font-semibold text-gray-900">Assign work order</h3>
+              <p className="text-sm text-gray-600 mt-1">#{showAssignFor.id}: {showAssignFor.title}</p>
+            </div>
+            <div className="p-5">
+              <label className="filter-label">Technician</label>
+              <select
+                value={assignTo}
+                onChange={(e) => setAssignTo(e.target.value)}
+                className="filter-select w-full mt-1"
+              >
+                {users.map((u) => (
+                  <option key={u.id} value={u.username}>
+                    {u.display_name} ({u.role.replace('_', ' ')})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="px-5 py-4 border-t border-gray-200 flex justify-end gap-2">
+              <button onClick={() => setShowAssignFor(null)} className="btn-secondary">
+                Cancel
+              </button>
+              <button onClick={handleAssign} className="btn-primary">
+                Assign
               </button>
             </div>
           </div>

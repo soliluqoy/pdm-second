@@ -91,6 +91,7 @@ export interface Rule {
   name: string;
   description?: string;
   rule_type: RuleType;
+  vehicle_id?: number | null;
   sensor_id?: number;
   sensor_type?: string;
   operator?: string;
@@ -101,8 +102,33 @@ export interface Rule {
   severity: AlertSeverity;
   work_order_template_id?: number;
   is_active: boolean;
+  dormant?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface RuleInput {
+  name: string;
+  description?: string;
+  rule_type: RuleType;
+  vehicle_id?: number | null;
+  sensor_type?: string;
+  operator?: string;
+  threshold_value?: number;
+  duration_seconds?: number;
+  dtc_code?: string;
+  interval_value?: number;
+  severity: AlertSeverity;
+  work_order_template_id?: number | null;
+  is_active?: boolean;
+}
+
+export interface User {
+  id: number;
+  username: string;
+  display_name: string;
+  role: UserRole;
+  is_active: boolean;
 }
 
 export interface WorkOrderTemplate {
@@ -280,4 +306,31 @@ export interface MaintenanceHistory {
 export interface WSMessage {
   channel: string;
   data: any;
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+export interface HistoryPoint {
+  t: string;
+  value: number;
+  min_value?: number;
+  max_value?: number;
+  count: number;
+}
+
+export interface SensorHistory {
+  sensor_type: string;
+  resolution: 'raw' | '1m' | '1h';
+  points: HistoryPoint[];
+}
+
+export interface TimelineEvent {
+  kind: 'alert' | 'work_order' | 'maintenance';
+  id: number;
+  timestamp: string;
+  title: string;
+  description?: string;
+  severity?: string;
+  status?: string;
+  work_order_id?: number;
+  alert_id?: number;
 }

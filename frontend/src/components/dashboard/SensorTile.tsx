@@ -1,11 +1,13 @@
 /**
  * PREDICT — SensorTile
- * One live sensor: name, value, status, and threshold summary.
+ * One live sensor: name, value, status, and threshold summary. Memoized so
+ * WS patches to other sensors/vehicles don't re-render every tile.
  */
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { LiveSensorItem } from '../../types';
 import {
   formatSensorValue,
+  sensorIcon,
   statusStyles,
   thresholdCaptions,
 } from '../../utils/sensors';
@@ -16,7 +18,7 @@ interface Props {
   onClick?: () => void;
 }
 
-export default function SensorTile({ sensor, onClick }: Props) {
+function SensorTileInner({ sensor, onClick }: Props) {
   const [flash, setFlash] = useState(false);
   const prevValue = useRef<number | null | undefined>(sensor.value);
 
@@ -33,6 +35,7 @@ export default function SensorTile({ sensor, onClick }: Props) {
   const styles = statusStyles[sensor.status];
   const captions = thresholdCaptions(sensor);
   const offline = sensor.status === 'offline';
+  const Icon = sensorIcon(sensor.sensor_type);
 
   return (
     <button
@@ -43,7 +46,10 @@ export default function SensorTile({ sensor, onClick }: Props) {
         ${styles.border} ${flash ? 'bg-predict-50' : styles.tileBg}`}
     >
       <div className="flex items-center justify-between gap-2 mb-2">
-        <span className="text-sm font-medium text-gray-800 truncate">{sensor.name}</span>
+        <span className="flex items-center gap-1.5 min-w-0">
+          <Icon className={`w-3.5 h-3.5 shrink-0 ${offline ? 'text-gray-400' : 'text-gray-500'}`} />
+          <span className="text-sm font-medium text-gray-800 truncate">{sensor.name}</span>
+        </span>
         <span className={`text-xs font-medium shrink-0 ${styles.text}`}>{styles.label}</span>
       </div>
 
@@ -64,3 +70,6 @@ export default function SensorTile({ sensor, onClick }: Props) {
     </button>
   );
 }
+
+const SensorTile = memo(SensorTileInner);
+export default SensorTile;

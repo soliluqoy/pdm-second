@@ -37,7 +37,7 @@ export default function TelemetryCatalogPanel({ catalog, note }: Props) {
   const [activeTab, setActiveTab] = useState(catalog[0]?.device_type ?? 'fmc001');
   const model = catalog.find((m) => m.device_type === activeTab) ?? catalog[0];
   const grouped = useMemo(
-    () => (model ? groupByComponent(model.sensors) : new Map()),
+    () => (model ? groupByComponent(model.sensors) : new Map<string, TelemetryCatalogSensorItem[]>()),
     [model]
   );
 
@@ -61,7 +61,7 @@ export default function TelemetryCatalogPanel({ catalog, note }: Props) {
               onClick={() => setActiveTab(m.device_type)}
               className={`px-3 py-1.5 text-sm font-medium rounded-t-md border-b-2 -mb-px transition-colors ${
                 activeTab === m.device_type
-                  ? 'border-blue-600 text-blue-700 bg-white'
+                  ? 'border-predict-500 text-predict-700 bg-white'
                   : 'border-transparent text-gray-600 hover:text-gray-900'
               }`}
             >

@@ -84,7 +84,12 @@ async def list_work_orders(
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(WorkOrder).order_by(WorkOrder.created_at.desc())
+    # Vehicle name joined in the list query — no per-row lookups.
+    stmt = (
+        select(WorkOrder, Vehicle.name)
+        .outerjoin(Vehicle, Vehicle.id == WorkOrder.vehicle_id)
+        .order_by(WorkOrder.created_at.desc())
+    )
     if status:
         stmt = stmt.where(WorkOrder.status == status)
     if priority:
@@ -95,8 +100,18 @@ async def list_work_orders(
         stmt = stmt.where(WorkOrder.is_shadow == is_shadow)
     stmt = stmt.offset(skip).limit(limit)
     result = await db.execute(stmt)
-    wos = result.scalars().all()
-    return [await _wo_to_out(db, wo) for wo in wos]
+    return [
+        WorkOrderOut(
+            id=wo.id, vehicle_id=wo.vehicle_id, alert_id=wo.alert_id,
+            template_id=wo.template_id, title=wo.title, description=wo.description,
+            priority=wo.priority, status=wo.status, instructions=wo.instructions,
+            assigned_to=wo.assigned_to, assigned_at=wo.assigned_at,
+            completed_at=wo.completed_at, completed_by=wo.completed_by,
+            completion_notes=wo.completion_notes, is_shadow=wo.is_shadow,
+            vehicle_name=vehicle_name, created_at=wo.created_at, updated_at=wo.updated_at,
+        )
+        for wo, vehicle_name in result.all()
+    ]
 
 
 @router.post("", response_model=WorkOrderOut, status_code=201)

@@ -9,11 +9,14 @@ import type {
   Fleet,
   MaintenanceHistory,
   Rule,
+  RuleInput,
   Sensor,
+  SensorHistory,
   SensorReading,
   TelemetryCatalog,
+  TimelineEvent,
+  User,
   Vehicle,
-  VehicleHealthItem,
   VehicleLiveItem,
   VehicleRegisterInput,
   WorkOrder,
@@ -22,6 +25,30 @@ import type {
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const API_PREFIX = '/api/v1';
+
+/** FastAPI `detail` can be a string, an object, or a validation-error array —
+ * normalize to a readable message instead of "[object Object]". */
+function normalizeErrorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d) => {
+        if (typeof d === 'string') return d;
+        const loc = Array.isArray(d?.loc) ? d.loc.slice(1).join('.') : '';
+        return loc ? `${loc}: ${d?.msg ?? ''}` : d?.msg ?? '';
+      })
+      .filter(Boolean);
+    if (msgs.length) return msgs.join('; ');
+  }
+  if (detail && typeof detail === 'object') {
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      /* fall through */
+    }
+  }
+  return fallback;
+}
 
 class ApiClient {
   private baseUrl: string;
@@ -50,8 +77,9 @@ class ApiClient {
     }
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: response.statusText }));
-      throw new Error(error.detail || `API Error: ${response.status}`);
+      const fallback = `API Error: ${response.status}`;
+      const body = await response.json().catch(() => null);
+      throw new Error(normalizeErrorDetail(body?.detail, fallback));
     }
 
     return response.json();
@@ -60,10 +88,6 @@ class ApiClient {
   // ── Dashboard ──────────────────────────────────────────────────────────────
   getDashboardSummary() {
     return this.request<DashboardSummary>('/dashboard/summary');
-  }
-
-  getFleetHealth() {
-    return this.request<VehicleHealthItem[]>('/dashboard/health');
   }
 
   getFleetLive() {
@@ -80,9 +104,20 @@ class ApiClient {
     return this.request<SensorReading[]>(`/dashboard/vehicles/${vehicleId}/readings?${params}`);
   }
 
-  getVehicleLatest(vehicleId: number) {
-    return this.request<Record<string, { value: number; unit: string; timestamp: string }>>(
-      `/dashboard/vehicles/${vehicleId}/latest`
+  /** Bucketed sensor history (Timescale continuous aggregates for long ranges). */
+  getSensorHistory(vehicleId: number, sensorType: string, hours: number, resolution = 'auto') {
+    const params = new URLSearchParams({
+      sensor_type: sensorType,
+      hours: String(hours),
+      resolution,
+    });
+    return this.request<SensorHistory>(`/dashboard/vehicles/${vehicleId}/history?${params}`);
+  }
+
+  /** Merged event stream: alerts + work orders + maintenance. */
+  getVehicleTimeline(vehicleId: number, limit = 100) {
+    return this.request<TimelineEvent[]>(
+      `/dashboard/vehicles/${vehicleId}/timeline?limit=${limit}`
     );
   }
 
@@ -110,6 +145,17 @@ class ApiClient {
     });
   }
 
+  updateVehicle(id: number, data: Partial<VehicleRegisterInput> & { is_active?: boolean }) {
+    return this.request<Vehicle>(`/assets/vehicles/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  deleteVehicle(id: number) {
+    return this.request<void>(`/assets/vehicles/${id}`, { method: 'DELETE' });
+  }
+
   getComponents(vehicleId: number) {
     return this.request<Component[]>(`/assets/vehicles/${vehicleId}/components`);
   }
@@ -118,18 +164,33 @@ class ApiClient {
     return this.request<Sensor[]>(`/assets/components/${componentId}/sensors`);
   }
 
+  updateSensor(
+    sensorId: number,
+    data: {
+      name?: string;
+      unit?: string;
+      min_value?: number | null;
+      max_value?: number | null;
+      warning_threshold?: number | null;
+      critical_threshold?: number | null;
+      is_active?: boolean;
+    }
+  ) {
+    return this.request<Sensor>(`/assets/sensors/${sensorId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
   // ── Work Orders ──────────────────────────────────────────────────────────────
-  getWorkOrders(params?: { status?: string; priority?: string; is_shadow?: boolean }) {
+  getWorkOrders(params?: { status?: string; priority?: string; is_shadow?: boolean; vehicle_id?: number }) {
     const query = new URLSearchParams();
     if (params?.status) query.set('status', params.status);
     if (params?.priority) query.set('priority', params.priority);
     if (params?.is_shadow !== undefined) query.set('is_shadow', String(params.is_shadow));
+    if (params?.vehicle_id !== undefined) query.set('vehicle_id', String(params.vehicle_id));
     const q = query.toString();
     return this.request<WorkOrder[]>(`/workorders${q ? '?' + q : ''}`);
-  }
-
-  getWorkOrder(id: number) {
-    return this.request<WorkOrder>(`/workorders/${id}`);
   }
 
   assignWorkOrder(id: number, assignedTo: string) {
@@ -165,11 +226,13 @@ class ApiClient {
   }
 
   // ── Alerts ──────────────────────────────────────────────────────────────────
-  getAlerts(params?: { status?: string; severity?: string; vehicle_id?: number }) {
+  getAlerts(params?: { status?: string; severity?: string; vehicle_id?: number; skip?: number; limit?: number }) {
     const query = new URLSearchParams();
     if (params?.status) query.set('status', params.status);
     if (params?.severity) query.set('severity', params.severity);
     if (params?.vehicle_id) query.set('vehicle_id', String(params.vehicle_id));
+    if (params?.skip) query.set('skip', String(params.skip));
+    if (params?.limit) query.set('limit', String(params.limit));
     const q = query.toString();
     return this.request<Alert[]>(`/alerts${q ? '?' + q : ''}`);
   }
@@ -182,6 +245,10 @@ class ApiClient {
     return this.request<Alert>(`/alerts/${id}/resolve`, { method: 'POST' });
   }
 
+  suppressAlert(id: number) {
+    return this.request<Alert>(`/alerts/${id}/suppress`, { method: 'POST' });
+  }
+
   // ── Rules ────────────────────────────────────────────────────────────────────
   getRules(params?: { rule_type?: string; is_active?: boolean }) {
     const query = new URLSearchParams();
@@ -191,11 +258,33 @@ class ApiClient {
     return this.request<Rule[]>(`/rules${q ? '?' + q : ''}`);
   }
 
+  createRule(data: RuleInput) {
+    return this.request<Rule>('/rules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  updateRule(id: number, data: Partial<RuleInput>) {
+    return this.request<Rule>(`/rules/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  deleteRule(id: number) {
+    return this.request<void>(`/rules/${id}`, { method: 'DELETE' });
+  }
+
   getTemplates() {
     return this.request<WorkOrderTemplate[]>('/rules/templates');
   }
 
   // ── System ───────────────────────────────────────────────────────────────────
+  getUsers() {
+    return this.request<User[]>('/system/users');
+  }
+
   getShadowMode() {
     return this.request<{ shadow_mode: boolean }>('/system/shadow-mode');
   }
@@ -207,20 +296,8 @@ class ApiClient {
     );
   }
 
-  getMaintenanceHistory(vehicleId?: number) {
-    const query = vehicleId ? `?vehicle_id=${vehicleId}` : '';
-    return this.request<MaintenanceHistory[]>(`/system/history${query}`);
-  }
-
   getVehicleHistory(vehicleId: number) {
     return this.request<MaintenanceHistory[]>(`/system/history/vehicle/${vehicleId}`);
-  }
-
-  // ── Health ──────────────────────────────────────────────────────────────────
-  getHealth() {
-    return this.request<{ status: string; service: string; version: string; shadow_mode: boolean }>(
-      '/health'
-    );
   }
 }
 

@@ -1,9 +1,11 @@
 /**
  * PREDICT — SensorDetailDrawer
- * Slide-over panel with a 1-hour history chart (threshold reference lines),
+ * Slide-over panel with a history chart (threshold reference lines),
  * window stats, and the active trigger rules for one sensor.
+ * Live value updates via WebSocket; chart refreshes when the range changes.
  */
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Area,
   AreaChart,
@@ -17,7 +19,7 @@ import {
 } from 'recharts';
 import { AlertTriangle, X } from 'lucide-react';
 import { api } from '../../api/client';
-import type { LiveSensorItem, SensorReading, VehicleLiveItem } from '../../types';
+import type { HistoryPoint, LiveSensorItem, SensorHistory, VehicleLiveItem } from '../../types';
 import {
   formatSensorValue,
   directionOperator,
@@ -41,24 +43,31 @@ const severityChip: Record<string, string> = {
   info: 'bg-blue-100 text-blue-700',
 };
 
+const RANGES = [
+  { label: '1h', hours: 1 },
+  { label: '6h', hours: 6 },
+  { label: '24h', hours: 24 },
+];
+
 export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) {
-  const [readings, setReadings] = useState<SensorReading[]>([]);
+  const [history, setHistory] = useState<SensorHistory | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hours, setHours] = useState(1);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     api
-      .getVehicleReadings(vehicle.id, sensor.sensor_type, 1)
+      .getSensorHistory(vehicle.id, sensor.sensor_type, hours)
       .then((data) => {
-        if (!cancelled) setReadings(data);
+        if (!cancelled) setHistory(data);
       })
       .catch((e) => console.error('Failed to load readings:', e))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [vehicle.id, sensor.sensor_type]);
+  }, [vehicle.id, sensor.sensor_type, hours]);
 
   // Close on Escape
   useEffect(() => {
@@ -69,11 +78,15 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
 
   const points: ChartPoint[] = useMemo(
     () =>
-      readings.map((r) => ({
-        time: new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      (history?.points ?? []).map((r: HistoryPoint) => ({
+        time: new Date(r.t).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: hours <= 1 ? '2-digit' : undefined,
+        }),
         value: r.value,
       })),
-    [readings]
+    [history, hours]
   );
 
   const stats = useMemo(() => {
@@ -128,7 +141,7 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
         </div>
 
         <div className="p-5 space-y-5">
-          {/* Current value + status */}
+          {/* Current value + status (updates live via parent WS patch) */}
           <div className={`panel p-4 flex items-center justify-between ${styles.border} ${styles.tileBg}`}>
             <div>
               <p className="text-sm text-gray-600">Current reading</p>
@@ -142,14 +155,32 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
 
           {/* History chart */}
           <div className="panel p-4">
-            <h3 className="text-sm font-semibold text-gray-900 mb-3">Last 60 minutes</h3>
+            <div className="flex items-center justify-between mb-3 gap-2">
+              <h3 className="text-sm font-semibold text-gray-900">History</h3>
+              <div className="flex gap-1">
+                {RANGES.map((r) => (
+                  <button
+                    key={r.hours}
+                    type="button"
+                    onClick={() => setHours(r.hours)}
+                    className={`px-2 py-1 rounded text-xs font-medium border ${
+                      hours === r.hours
+                        ? 'bg-predict-50 border-predict-300 text-predict-700'
+                        : 'bg-white border-gray-200 text-gray-600'
+                    }`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             {loading ? (
               <div className="h-56 flex items-center justify-center text-sm text-gray-400 animate-pulse">
                 Loading history…
               </div>
             ) : points.length === 0 ? (
               <div className="h-56 flex items-center justify-center text-sm text-gray-400">
-                No readings in the last hour.
+                No readings in this window.
               </div>
             ) : (
               <div className="h-56">
@@ -168,7 +199,6 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
                       formatter={(v: any) => [`${formatSensorValue(Number(v))}${unit}`, sensor.name]}
                       contentStyle={{ fontSize: 12, borderRadius: 8 }}
                     />
-                    {/* Danger zone shading */}
                     {sensor.critical_threshold != null && sensor.direction === 'high' && (
                       <ReferenceArea y1={sensor.critical_threshold} y2={yMax} fill="#ef4444" fillOpacity={0.07} />
                     )}
@@ -196,15 +226,24 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
                 </ResponsiveContainer>
               </div>
             )}
+            <div className="mt-3 text-right">
+              <Link
+                to={`/vehicles/${vehicle.id}`}
+                className="text-xs text-predict-600 hover:underline"
+                onClick={onClose}
+              >
+                Full history →
+              </Link>
+            </div>
           </div>
 
           {/* Window stats */}
           {stats && (
             <div className="grid grid-cols-3 gap-3">
               {[
-                { label: 'Min (1h)', v: stats.min },
-                { label: 'Avg (1h)', v: stats.avg },
-                { label: 'Max (1h)', v: stats.max },
+                { label: `Min (${hours}h)`, v: stats.min },
+                { label: `Avg (${hours}h)`, v: stats.avg },
+                { label: `Max (${hours}h)`, v: stats.max },
               ].map((s) => (
                 <div key={s.label} className="rounded-lg border border-gray-200 p-3 text-center">
                   <p className="text-xs text-gray-500">{s.label}</p>
@@ -219,16 +258,16 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
 
           {/* Thresholds */}
           <div className="panel p-4">
-            <h3 className="text-sm font-semibold text-gray-900 mb-2">Thresholds</h3>
+            <h3 className="text-sm font-semibold text-gray-900 mb-2">Display thresholds</h3>
             <div className="grid grid-cols-2 gap-2 text-sm">
               <div className="flex justify-between rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
-                <span className="text-amber-800">Warning trigger</span>
+                <span className="text-amber-800">Warning</span>
                 <span className="font-semibold text-amber-800 tabular-nums">
                   {sensor.warning_threshold != null ? `${op} ${formatSensorValue(sensor.warning_threshold)}${unit}` : '—'}
                 </span>
               </div>
               <div className="flex justify-between rounded-lg bg-red-50 border border-red-200 px-3 py-2">
-                <span className="text-red-800">Critical trigger</span>
+                <span className="text-red-800">Critical</span>
                 <span className="font-semibold text-red-800 tabular-nums">
                   {sensor.critical_threshold != null ? `${op} ${formatSensorValue(sensor.critical_threshold)}${unit}` : '—'}
                 </span>
@@ -240,6 +279,9 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
                 {sensor.direction === 'low' ? ' · low values are bad' : ' · high values are bad'}
               </p>
             )}
+            <p className="text-xs text-gray-400 mt-1">
+              Tile colors use these. Alerts are fired by the trigger rules below.
+            </p>
           </div>
 
           {/* Trigger rules */}
@@ -248,7 +290,12 @@ export default function SensorDetailDrawer({ vehicle, sensor, onClose }: Props) 
               Trigger rules ({sensor.rules.length})
             </h3>
             {sensor.rules.length === 0 ? (
-              <p className="text-sm text-gray-400">No rules fire on this sensor.</p>
+              <p className="text-sm text-gray-400">
+                No rules fire on this sensor.{' '}
+                <Link to="/rules" className="text-predict-600 hover:underline" onClick={onClose}>
+                  Create one →
+                </Link>
+              </p>
             ) : (
               <ul className="space-y-2">
                 {sensor.rules.map((r) => (
